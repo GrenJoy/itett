@@ -1,0 +1,264 @@
+В oneshot можно было отправить только один скриншот, а второй отклонялся или игнорировался, пока сессия не завершена.
+В multishot и edit можно было отправлять несколько скриншотов без лишних ограничений, но с защитой от перегрузки (как с 630 скриншотами).
+Избежать ситуации, когда бот создает два Excel-файла в oneshot из-за отправки второго скриншота.
+
+
+Проблема и ее причины
+
+В oneshot можно отправить второй скриншот:
+
+В bot.ts, обработчик handlePhoto не проверяет, был ли уже обработан скриншот в текущей сессии для режима oneshot. Если пользователь отправляет второй скриншот до завершения обработки первого, бот может начать обрабатывать его, что может привести к:
+
+Либо созданию второго Excel-файла (если первая сессия завершилась, а вторая началась).
+Либо путанице в данных сессии, так как предметы из второго скриншота добавятся в ту же сессию.
+
+
+
+
+Перегрузка в multishot:
+
+В режиме multishot нет ограничений на количество скриншотов, что привело к проблеме с 630 скриншотами. Это вызвало ошибки 429 от Warframe Market и Telegram API.
+Если добавить слишком жесткие ограничения (например, один скриншот за раз с ожиданием), пользователи будут раздражаться из-за медленной обработки.
+
+
+Сходство multishot и oneshot:
+
+Режим multishot по сути использует ту же логику, что и oneshot, но сессия не завершается после каждого скриншота. Это делает ограничения в oneshot сложными для реализации без влияния на multishot.
+
+
+Потенциальные баги:
+
+Если пользователь отправляет второй скриншот в oneshot, пока бот отвечает "Анализирую изображение", сессия может не завершиться корректно, и предметы из второго скриншота попадут в базу, но в отдельный Excel-файл.
+
+
+
+
+Решение
+Чтобы решить проблему, нужно:
+
+В режиме oneshot строго ограничить обработку одним скриншотом за сессию и отклонять дополнительные скриншоты.
+В режиме multishot и edit сохранить возможность обработки нескольких скриншотов, но с мягкими ограничениями для защиты от перегрузки.
+Добавить четкое различие между режимами в коде, чтобы ограничения oneshot не влияли на multishot.
+Улучшить обработку ошибок и сообщений, чтобы пользователь понимал, что происходит.
+
+1. Ограничение в oneshot: один скриншот за сессию
+
+В bot.ts, в обработчике handlePhoto, добавим проверку, чтобы в режиме oneshot бот принимал только один скриншот и отклонял последующие до завершения сессии.
+В BotContext добавим флаг mode в сессию, чтобы отслеживать текущий режим (oneshot, multishot, edit, etc.).
+После обработки первого скриншота в oneshot сразу завершаем сессию.
+
+Изменения в bot.ts:
+typescriptinterface BotContext extends Context {
+  session?: {
+    sessionId?: string;
+    waitingForExcel?: boolean;
+    waitingForPriceUpdate?: boolean;
+    waitingForSplitPrice?: boolean;
+    splitThreshold?: number;
+    mode?: 'oneshot' | 'multishot' | 'edit' | 'price_update' | 'split_excel'; // Новый флаг
+    screenshotProcessed?: boolean; // Флаг для oneshot
+    screenshotCount?: number; // Для отслеживания в multishot
+  };
+}
+
+// В обработчике mode_oneshot
+bot.action('mode_oneshot', async (ctx) => {
+  await ctx.answerCbQuery();
+  const telegramId = ctx.from?.id.toString();
+  if (!telegramId) return;
+  const user = await storage.getUserByTelegramId(telegramId);
+  if (!user) return;
+
+  // Отменяем активную сессию, если есть
+  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  if (existingSession) {
+    await storage.updateSessionStatus(existingSession.id, 'cancelled');
+  }
+
+  const session = await storage.createSession({
+    userId: user.id,
+    telegramId,
+    type: 'oneshot',
+    status: 'active'
+  });
+
+  ctx.session = {
+    sessionId: session.id,
+    waitingForExcel: false,
+    waitingForPriceUpdate: false,
+    waitingForSplitPrice: false,
+    mode: 'oneshot',
+    screenshotProcessed: false
+  };
+
+  await ctx.editMessageText(
+    '📸 Отправьте один скриншот инвентаря Warframe.\n\n' +
+    '🔙 Для отмены нажмите кнопку ниже.',
+    Markup.inlineKeyboard([[Markup.button.callback('🔙 Отмена', 'cancel_session')]])
+  );
+});
+
+// Модифицируем handlePhoto
+async function handlePhoto(ctx: BotContext) {
+  if (!ctx.session?.sessionId || !ctx.session?.mode) {
+    await ctx.reply('❌ Нет активной сессии. Используйте /start');
+    return;
+  }
+
+  const sessionId = ctx.session.sessionId;
+
+  // Проверка для oneshot
+  if (ctx.session.mode === 'oneshot' && ctx.session.screenshotProcessed) {
+    await ctx.reply('❌ В режиме одноразового анализа можно отправить только один скриншот. Сессия завершена.');
+    await completeSession(ctx);
+    return;
+  }
+
+  // Ограничение для multishot
+  const MAX_SCREENSHOTS = 50;
+  const MAX_ITEMS = 1000;
+  const existingItems = await storage.getItemsBySessionId(sessionId);
+  if (ctx.session.mode === 'multishot') {
+    ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
+    if (ctx.session.screenshotCount > MAX_SCREENSHOTS) {
+      await ctx.reply(`❌ Превышен лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию.`);
+      await completeSession(ctx);
+      return;
+    }
+    if (existingItems.length >= MAX_ITEMS) {
+      await ctx.reply(`❌ Превышен лимит предметов (${MAX_ITEMS}). Завершаю сессию.`);
+      await completeSession(ctx);
+      return;
+    }
+  }
+
+  const photo = ctx.message?.photo;
+  if (!photo) {
+    await ctx.reply('❌ Пожалуйста, отправьте изображение.');
+    return;
+  }
+
+  try {
+    await ctx.reply('🔄 Анализирую изображение...');
+
+    // Получаем самую большую версию фото
+    const fileId = photo[photo.length - 1].file_id;
+    const file = await ctx.telegram.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const response = await fetch(fileUrl);
+    const buffer = await response.arrayBuffer();
+    const base64Image = Buffer.from(buffer).toString('base64');
+
+    // Анализируем скриншот
+    const extractedItems = await analyzeWarframeScreenshot(base64Image);
+    if (extractedItems.length === 0) {
+      await ctx.reply('⚠️ Не удалось распознать предметы на скриншоте.');
+      if (ctx.session.mode === 'oneshot') {
+        await completeSession(ctx);
+      }
+      return;
+    }
+
+    // Обрабатываем предметы
+    const inventoryItems: InsertInventoryItem[] = [];
+    for (const item of extractedItems) {
+      let marketItem = null;
+      try {
+        marketItem = await processItemForMarket(item.name);
+      } catch (error) {
+        console.warn(`Could not find market data for item: ${item.name}`);
+      }
+
+      inventoryItems.push({
+        sessionId,
+        name: item.name,
+        slug: marketItem?.slug || null,
+        quantity: item.quantity || 1,
+        sellPrices: marketItem?.sellPrices || [],
+        buyPrices: marketItem?.buyPrices || [],
+        avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
+        avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+        marketUrl: marketItem?.marketUrl || null,
+        source: 'screenshot'
+      });
+    }
+
+    // Сохраняем предметы
+    const consolidatedItems = consolidateNewItems(inventoryItems);
+    await storage.createInventoryItems(consolidatedItems);
+
+    // Для oneshot завершаем сессию сразу
+    if (ctx.session.mode === 'oneshot') {
+      ctx.session.screenshotProcessed = true;
+      await completeSession(ctx);
+    } else {
+      // Для multishot показываем кнопку завершения
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+        [Markup.button.callback('🔙 Отмена', 'cancel_session')]
+      ]);
+      await ctx.reply(
+        `✅ Скриншот обработан, найдено предметов: ${consolidatedItems.length}\n` +
+        `📊 Всего в сессии: ${existingItems.length + consolidatedItems.length}\n\n` +
+        '📸 Отправьте следующий скриншот или завершите сессию.',
+        keyboard
+      );
+    }
+  } catch (error) {
+    console.error(`Error processing photo for session ${sessionId}:`, error);
+    await ctx.reply('❌ Ошибка при обработке скриншота. Попробуйте позже.');
+    if (ctx.session.mode === 'oneshot') {
+      await completeSession(ctx);
+    }
+  }
+}
+Что изменилось:
+
+Добавлен флаг mode в BotContext.session для отслеживания режима.
+В oneshot добавлен флаг screenshotProcessed, который устанавливается после обработки первого скриншота.
+Если пользователь отправляет второй скриншот в oneshot, бот отклоняет его и завершает сессию.
+В multishot сохраняется возможность отправлять несколько скриншотов с ограничением MAX_SCREENSHOTS и MAX_ITEMS.
+
+2. Мягкие ограничения для multishot и edit
+
+Чтобы избежать перегрузки, как с 630 скриншотами, используем p-limit для ограничения параллельных запросов к Warframe Market и Gemini API, как предложено ранее.
+В warframe-market.ts:
+typescriptimport pLimit from 'p-limit';
+const limit = pLimit(2); // 2 запроса одновременно
+
+export async function processItemForMarket(itemName: string): Promise<WarframeMarketItem | null> {
+  return limit(async () => {
+    const slug = findItemSlug(itemName);
+    if (!slug) {
+      console.log(`Item not found in cache: ${itemName}`);
+      return null;
+    }
+    return await getItemPrices(slug);
+  });
+}
+
+В gemini.ts:
+typescriptimport pLimit from 'p-limit';
+const geminiLimit = pLimit(5); // 5 запросов к Gemini одновременно
+
+export async function analyzeWarframeScreenshot(base64Image: string): Promise<ExtractedItem[]> {
+  return geminiLimit(async () => {
+    // ... существующий код ...
+  });
+}
+
+Эти ограничения позволяют обрабатывать несколько скриншотов в multishot без перегрузки API, но пользователю не придется ждать обработки каждого скриншота по очереди.
+
+3. Защита от двух Excel-файлов в oneshot
+
+Поскольку completeSession теперь вызывается сразу после обработки первого скриншота в oneshot, второй скриншот не попадет в ту же сессию.
+Если пользователь успеет отправить второй скриншот до завершения completeSession (например, из-за задержки в Telegram API), флаг screenshotProcessed предотвратит его обработку.
+
+4. Улучшение сообщений для пользователя
+
+В handlePhoto добавлены информативные сообщения, чтобы пользователь понимал, почему второй скриншот отклонен в oneshot:
+typescriptif (ctx.session.mode === 'oneshot' && ctx.session.screenshotProcessed) {
+  await ctx.reply('❌ В режиме одноразового анализа можно отправить только один скриншот. Сессия завершена.');
+  await completeSession(ctx);
+  return;
+}

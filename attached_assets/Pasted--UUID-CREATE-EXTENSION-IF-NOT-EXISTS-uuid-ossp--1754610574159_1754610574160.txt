@@ -1,0 +1,55 @@
+-- Включение расширения UUID
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Таблица пользователей
+CREATE TABLE users (
+    id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid(),
+    telegram_id TEXT NOT NULL UNIQUE,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+-- Индекс для быстрого поиска по telegram_id
+CREATE INDEX idx_users_telegram_id ON users(telegram_id);
+
+-- Таблица сессий
+CREATE TABLE sessions (
+    id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    telegram_id TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('oneshot', 'multishot', 'edit', 'price_update', 'split_excel')),
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cancelled')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Индексы для сессий
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_telegram_id ON sessions(telegram_id);
+CREATE INDEX idx_sessions_status ON sessions(status);
+CREATE INDEX idx_sessions_type ON sessions(type);
+
+-- Таблица предметов инвентаря
+CREATE TABLE inventory_items (
+    id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(255) NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    slug TEXT,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    sell_prices JSONB DEFAULT '[]'::jsonb NOT NULL,
+    buy_prices JSONB DEFAULT '[]'::jsonb NOT NULL,
+    avg_sell INTEGER DEFAULT 0 NOT NULL,
+    avg_buy INTEGER DEFAULT 0 NOT NULL,
+    market_url TEXT,
+    source TEXT NOT NULL CHECK (source IN ('screenshot', 'excel')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+);
+
+-- Индексы для предметов
+CREATE INDEX idx_inventory_items_session_id ON inventory_items(session_id);
+CREATE INDEX idx_inventory_items_name ON inventory_items(name);
+CREATE INDEX idx_inventory_items_slug ON inventory_items(slug);
+
+

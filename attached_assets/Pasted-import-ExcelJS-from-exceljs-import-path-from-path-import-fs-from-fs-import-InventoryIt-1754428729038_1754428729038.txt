@@ -1,0 +1,108 @@
+import ExcelJS from 'exceljs';
+import path from 'path';
+import fs from 'fs';
+import { InventoryItem, InsertInventoryItem } from '@shared/schema';
+
+export async function createExcelFromItems(items: InventoryItem[], sessionId: string): Promise<string> {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Инвентарь Warframe');
+
+  // Заголовки столбцов (как в оригинальном проекте)
+  worksheet.columns = [
+    { header: 'Название', key: 'name', width: 30 },
+    { header: 'Количество', key: 'quantity', width: 12 },
+    { header: 'Цена продажи', key: 'sellPrice', width: 15 },
+    { header: 'Цена покупки', key: 'buyPrice', width: 15 },
+    { header: 'Средняя цена (продажи)', key: 'avgSell', width: 20 },
+    { header: 'Ссылка', key: 'marketUrl', width: 50 }
+  ];
+
+  // Стилизация заголовков
+  worksheet.getRow(1).font = { bold: true };
+  worksheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FFE0E0E0' }
+  };
+
+  // Добавить данные
+  items.forEach(item => {
+    worksheet.addRow({
+      name: item.name,
+      quantity: item.quantity,
+      sellPrice: item.sellPrices?.length > 0 ? item.sellPrices.join(', ') : '',
+      buyPrice: item.buyPrices?.length > 0 ? item.buyPrices.join(', ') : '',
+      avgSell: item.avgSell || 0,
+      marketUrl: item.marketUrl || ''
+    });
+  });
+
+  // Создать временный файл
+  const tempDir = path.join(process.cwd(), 'temp');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
+  const filePath = path.join(tempDir, `warframe_inventory_${sessionId}_${Date.now()}.xlsx`);
+  
+  await workbook.xlsx.writeFile(filePath);
+  
+  return filePath;
+}
+
+export async function parseExcelFile(buffer: Buffer): Promise<InsertInventoryItem[]> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  
+  const worksheet = workbook.getWorksheet(1);
+  if (!worksheet) {
+    throw new Error('Рабочий лист не найден');
+  }
+
+  const items: InsertInventoryItem[] = [];
+  
+  // Пропустить заголовок (первая строка)
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return; // Пропустить заголовок
+    
+    const name = row.getCell(1).text;
+    const quantity = Number(row.getCell(2).value) || 1;
+    const sellPricesText = row.getCell(3).text;
+    const buyPricesText = row.getCell(4).text;
+    const avgSell = Number(row.getCell(5).value) || 0;
+    const marketUrl = row.getCell(6).text;
+
+    if (name) {
+      // Парсинг цен из текста
+      const sellPrices = sellPricesText ? 
+        sellPricesText.split(',').map(p => Number(p.trim())).filter(p => !isNaN(p)) : [];
+      const buyPrices = buyPricesText ? 
+        buyPricesText.split(',').map(p => Number(p.trim())).filter(p => !isNaN(p)) : [];
+
+      items.push({
+        name: name.trim(),
+        slug: null, // Будет определен при поиске в маркете
+        quantity,
+        sellPrices,
+        buyPrices,
+        avgSell,
+        avgBuy: 0, // Будет вычислен из buyPrices
+        marketUrl: marketUrl || null,
+        category: null,
+        sessionId: "", // Будет установлен в вызывающем коде
+      });
+    }
+  });
+
+  return items;
+}
+
+export async function splitExcelByPrice(items: InventoryItem[], sessionId: string, threshold: number = 11): Promise<{lowPriceFile: string, highPriceFile: string}> {
+  const lowPriceItems = items.filter(item => (item.avgSell || 0) <= threshold);
+  const highPriceItems = items.filter(item => (item.avgSell || 0) > threshold);
+
+  const lowPriceFile = await createExcelFromItems(lowPriceItems, `${sessionId}_low`);
+  const highPriceFile = await createExcelFromItems(highPriceItems, `${sessionId}_high`);
+
+  return { lowPriceFile, highPriceFile };
+}
