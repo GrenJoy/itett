@@ -1,3 +1,8 @@
+// ↓↓↓ ДОБАВЬТЕ ЭТИ ДВЕ СТРОКИ СЮДА ↓↓↓
+import dns from 'dns';
+dns.setDefaultResultOrder('ipv4first');
+
+// --- Дальше идет ваш существующий код ---
 import pkg from 'pg';
 const { Pool } = pkg;
 import { drizzle } from 'drizzle-orm/node-postgres'; // ← используем node-postgres адаптер
