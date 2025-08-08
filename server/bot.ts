@@ -1,11 +1,10 @@
 import { Telegraf, Context, Markup } from 'telegraf';
 import { storage } from './storage';
 import { analyzeWarframeScreenshot } from './services/gemini';
-import { generateExcelBuffer, parseExcelBuffer } from './services/excel';
+import { generateExcelBuffer, parseExcelBuffer, generateTextContent } from './services/excel';
 import { consolidateItems, consolidateNewItems } from './services/item-consolidation';
 import { type InsertInventoryItem } from '@shared/schema';
 import { processItemForMarket, getCorrectedItemName } from './services/warframe-market';
-import { generateExcelBuffer, parseExcelBuffer, generateTextContent } from './services/excel';
 // Вверху файла bot.ts
 const processingLock = new Set<string>();
 const photoQueue = new Map<string, string[]>();
@@ -96,16 +95,12 @@ async function processRawItems(ctx: BotContext, rawItems: { name: string; quanti
   // Удаляем сообщение "Проверяю названия..."
   await ctx.deleteMessage(loadingMessage.message_id);
 
-  // Ответ пользователю
-  if (ctx.session?.mode !== 'oneshot') {
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
-      [Markup.button.callback('❌ Отменить', 'cancel_session')]
-    ]);
-    await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
-  } else {
-    await ctx.reply(responseText, { parse_mode: 'Markdown' });
-  }
+  // Ответ пользователю (всегда с кнопками для многоразового режима)
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+    [Markup.button.callback('❌ Отменить', 'cancel_session')]
+  ]);
+  await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
 }
 
 interface BotContext extends Context {
@@ -115,7 +110,7 @@ interface BotContext extends Context {
     waitingForPriceUpdate?: boolean;
     waitingForSplitPrice?: boolean;
     splitThreshold?: number;
-    mode?: 'oneshot' | 'multishot' | 'edit' | 'price_update' | 'split_excel';
+    mode?: 'multishot' | 'edit' | 'price_update' | 'split_excel';
     screenshotProcessed?: boolean;
     screenshotCount?: number;
     lastExport?: {
@@ -215,7 +210,6 @@ bot.action('create_session', async (ctx) => {
   await ctx.answerCbQuery();
   
   const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🎯 Одноразовый анализ', 'mode_oneshot')],
     [Markup.button.callback('📊 Многоразовый анализ', 'mode_multishot')],
     [Markup.button.callback('📝 Редактирование Excel', 'mode_edit')],
     [Markup.button.callback('💰 Обновить цены в Excel', 'mode_update_prices')],
@@ -225,10 +219,9 @@ bot.action('create_session', async (ctx) => {
 
   await ctx.editMessageText(
     '🎯 *Выберите тип сессии:*\n\n' +
-    '*🎯 Одноразовый анализ*\n' +
-    'Отправляете скриншоты → получаете Excel файл → сессия завершается\n\n' +
     '*📊 Многоразовый анализ*\n' +
-    'Накапливаете предметы из разных скриншотов → завершаете кнопкой\n\n' +
+    'Накапливаете предметы из разных скриншотов → завершаете кнопкой\n' +
+    'Лимит: 16 скриншотов, время сессии: 1 час\n\n' +
     '*📝 Редактирование Excel*\n' +
     'Загружаете существующий Excel → добавляете новые скриншоты → получаете обновленный файл\n\n' +
     '*💰 Обновление цен*\n' +
@@ -241,14 +234,9 @@ bot.action('create_session', async (ctx) => {
 });
 
 // Mode selection handlers
-bot.action('mode_oneshot', async (ctx) => {
-  await ctx.answerCbQuery();
-  await startSession(ctx, 'oneshot');
-});
-
 bot.action('mode_multishot', async (ctx) => {
   await ctx.answerCbQuery();
-  await startSession(ctx, 'multishot');
+  await startSession(ctx);
 });
 
 bot.action('mode_edit', async (ctx) => {
@@ -295,17 +283,14 @@ bot.action('help', async (ctx) => {
   await ctx.answerCbQuery(); // Рекомендуется добавлять, чтобы убрать "часики" с кнопки
   await ctx.editMessageText(
     '📋 *Инструкция по использованию:*\n\n' +
-    '*Одноразовый режим:*\n' +
-    '• Отправьте скриншоты инвентаря\n' +
-    '• Получите Excel файл с анализом\n' +
-    '• Данные автоматически очищаются\n\n' +
-    '*Многоразовый режим:*\n' +
-    '• Отправляйте скриншоты постепенно\n' +
-    '• Данные накапливаются\n' +
-    '• Нажмите "Завершить" для получения Excel\n\n' +
-    '*Редактирование:*\n' +
+    '*📊 Многоразовый режим:*\n' +
+    '• Отправляйте скриншоты постепенно (до 16 штук)\n' +
+    '• Данные накапливаются в течение 1 часа\n' +
+    '• Нажмите "Завершить" для получения Excel\n' +
+    '• При достижении лимита сессия завершается автоматически\n\n' +
+    '*📝 Редактирование:*\n' +
     '• Загрузите существующий Excel файл\n' +
-    '• Добавьте новые скриншоты\n' +
+    '• Добавьте новые скриншоты (до 16 штук)\n' +
     '• Получите объединенный файл\n\n' +
     '*💰 Обновление цен:*\n' +
     '• Загрузите старый Excel файл\n' +
@@ -314,9 +299,7 @@ bot.action('help', async (ctx) => {
     '*📊 Разделение Excel:*\n' +
     '• Загрузите Excel файл с ценами\n' +
     '• Укажите пороговую цену (например: 12)\n' +
-    // ИЗМЕНЕНИЕ ЗДЕСЬ:
     '• Получите 2 файла: `high_price` и `low_price`\n' +
-    // И ИЗМЕНЕНИЕ ЗДЕСЬ:
     '• Логика: 3+ цены выше порога → `high_price`\n\n' +
     '*📊 Дополнительные команды:*\n' +
     '• `/status` - показать статус текущей сессии\n\n' +
@@ -342,10 +325,6 @@ bot.command('status', async (ctx) => {
     
     if (ctx.session.mode) {
       switch (ctx.session.mode) {
-        case 'oneshot':
-          modeText = '🎯 Одноразовый';
-          maxScreenshots = 1;
-          break;
         case 'multishot':
           modeText = '📊 Многоразовый';
           maxScreenshots = 16;
@@ -518,12 +497,12 @@ bot.action('cancel_session', async (ctx) => {
   await ctx.reply('❌ Сессия отменена. Очередь обработки очищена. Нажмите /start, чтобы начать новую.');
 });
 
-async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
+async function startSession(ctx: BotContext) {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
 
-  // ✅ Объявляем один раз с let
-  let existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  // Cancel any existing active session
+  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
     await storage.updateSessionStatus(existingSession.id, 'cancelled');
   }
@@ -532,11 +511,11 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
   const user = await storage.getUserByTelegramId(telegramId);
   if (!user) return;
 
-  // Create new session
+  // Create new multishot session
   const session = await storage.createSession({
     userId: user.id,
     telegramId,
-    type,
+    type: 'multishot',
     status: 'active'
   });
 
@@ -544,35 +523,28 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
     throw new Error('Failed to create session');
   }
 
-  console.log('Created session:', session);
+  console.log('Created multishot session:', session);
 
-  // ✅ Переиспользуем переменную, не объявляя заново
-  existingSession = await storage.getActiveSessionByTelegramId(telegramId);
-  console.log('Existing session:', existingSession);
+  ctx.session!.sessionId = session.id;
+  ctx.session!.mode = 'multishot';
+  ctx.session!.screenshotProcessed = false;
+  ctx.session!.screenshotCount = 0;
+  ctx.session!.waitingForExcel = false;
+  ctx.session!.waitingForPriceUpdate = false;
+  ctx.session!.waitingForSplitPrice = false;
 
-  ctx.session.sessionId = session.id;
-  ctx.session.mode = type;
-  ctx.session.screenshotProcessed = false;
-  ctx.session.screenshotCount = 0;
-  ctx.session.waitingForExcel = false;
-  ctx.session.waitingForPriceUpdate = false;
-  ctx.session.waitingForSplitPrice = false;
-
-  const keyboard = type === 'multishot' 
-    ? Markup.inlineKeyboard([
-        [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
-        [Markup.button.callback('❌ Отменить', 'cancel_session')]
-      ])
-    : Markup.inlineKeyboard([[Markup.button.callback('❌ Отменить', 'cancel_session')]]);
-
-  const modeText = type === 'oneshot' ? 'одноразовый' : 'многоразовый';
-  const limitText = type === 'multishot' ? '\n⚠️ Максимум 16 скриншотов за сессию' : '\n⚠️ Только один скриншот в данном режиме';
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+    [Markup.button.callback('❌ Отменить', 'cancel_session')]
+  ]);
   
   await ctx.editMessageText(
-    `🎯 Запущен ${modeText} режим анализа\n\n` +
+    `🎯 Запущен многоразовый режим анализа\n\n` +
     `📸 Отправьте скриншоты инвентаря Warframe\n` +
-    `Поддерживаемые форматы: JPG, PNG, WEBP${limitText}\n\n` +
-    `${type === 'multishot' ? '💡 Вы можете отправлять скриншоты по частям и завершить сессию кнопкой ниже' : '💡 После отправки скриншота вы автоматически получите Excel файл'}`,
+    `Поддерживаемые форматы: JPG, PNG, WEBP\n` +
+    `⚠️ Максимум 16 скриншотов за сессию\n` +
+    `⏰ Время сессии: 1 час\n\n` +
+    `💡 Вы можете отправлять скриншоты по частям и завершить сессию кнопкой ниже`,
     { parse_mode: 'Markdown', ...keyboard }
   );
 }
@@ -840,25 +812,9 @@ async function completeSession(ctx: BotContext) {
       return;
     }
 
-    // Логика для oneshot
-    if (session?.type === 'oneshot') {
-      await storage.updateSessionStatus(sessionId, 'completed');
-      // ВСТАВКА: Очистка ресурсов
-      const telegramId = ctx.from?.id.toString();
-      if (telegramId) {
-        photoQueue.delete(telegramId);
-        cancellationRequests.delete(telegramId);
-      }
-      ctx.session = {};
-
-      await ctx.reply(`✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}`);
-      await ctx.replyWithDocument(
-        { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
-        { caption: `📋 Ваш инвентарь Warframe\n📊 Предметов: ${items.length}` }
-      );
-    } else {
-      // Логика для multishot, edit, price_update
-      let textContent;
+    // All sessions now use multishot logic
+    // Logic for all session types (multishot, edit, price_update)
+    let textContent;
       try {
         textContent = generateTextContent(items);
       } catch (error) {
@@ -900,7 +856,7 @@ async function completeSession(ctx: BotContext) {
         return;
       }
 
-      ctx.session.lastExport = {
+      ctx.session!.lastExport = {
         excel: excelBuffer.toString('base64'),
         text: textContent,
         itemsCount: items.length
@@ -922,7 +878,6 @@ async function completeSession(ctx: BotContext) {
       } else {
         await ctx.reply(messageText, keyboard);
       }
-    }
   } catch (error) {
     console.error('Error completing session:', error);
     await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
@@ -953,8 +908,8 @@ async function processPhotoQueue(ctx: BotContext) {
     return;
   }
 
-  // Определяем лимит скриншотов
-  const MAX_SCREENSHOTS = ctx.session.mode === 'oneshot' ? 1 : ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  // Определяем лимит скриншотов (всегда 16 для всех режимов анализа)
+  const MAX_SCREENSHOTS = ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
   if (MAX_SCREENSHOTS === 0) {
     console.error(`[Worker] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
     await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
@@ -994,11 +949,11 @@ async function processPhotoQueue(ctx: BotContext) {
 
       // Внутренний try...catch для обработки ОДНОГО фото
       try {
-        console.log(`[Worker] Processing photo for user ${telegramId}, mode: ${ctx.session.mode}, screenshotCount: ${ctx.session.screenshotCount + 1}/${MAX_SCREENSHOTS}`);
+        console.log(`[Worker] Processing photo for user ${telegramId}, mode: ${ctx.session!.mode}, screenshotCount: ${(ctx.session?.screenshotCount || 0) + 1}/${MAX_SCREENSHOTS}`);
         const remainingInQueue = photoQueue.get(telegramId)?.length || 0;
         const loadingMessage = await ctx.reply(`🔄 Анализирую скриншот... (${remainingInQueue} в очереди)`);
 
-        ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
+        ctx.session!.screenshotCount = (ctx.session?.screenshotCount || 0) + 1;
 
         const fileInfo = await ctx.telegram.getFile(fileId);
         const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
@@ -1102,11 +1057,7 @@ async function processPhotoQueue(ctx: BotContext) {
 
         await ctx.deleteMessage(loadingMessage.message_id);
 
-        if (ctx.session.mode === 'oneshot') {
-          ctx.session.screenshotProcessed = true;
-          await ctx.reply(responseText, { parse_mode: 'Markdown' });
-          await completeSession(ctx);
-        } else if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+        if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
           await ctx.reply(responseText + `\n⚠️ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`, { parse_mode: 'Markdown' });
           await completeSession(ctx);
         } else {
@@ -1143,8 +1094,21 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  // Проверка лимита скриншотов
-  const MAX_SCREENSHOTS = ctx.session.mode === 'oneshot' ? 1 : ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  // Проверка срока жизни сессии (1 час)
+  const session = await storage.getSession(ctx.session.sessionId);
+  if (session) {
+    const sessionAge = Date.now() - new Date(session.createdAt).getTime();
+    const maxSessionAge = 60 * 60 * 1000; // 1 час в миллисекундах
+    
+    if (sessionAge > maxSessionAge) {
+      await ctx.reply('⏰ Сессия истекла (прошел 1 час). Завершаю сессию...');
+      await completeSession(ctx);
+      return;
+    }
+  }
+
+  // Проверка лимита скриншотов (16 для всех режимов анализа)
+  const MAX_SCREENSHOTS = ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
   if (MAX_SCREENSHOTS === 0) {
     console.error(`[Photo] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
     await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');

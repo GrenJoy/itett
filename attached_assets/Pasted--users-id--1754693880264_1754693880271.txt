@@ -1,0 +1,188 @@
+Анализ текущей схемы и различий
+Текущая схема (по твоему описанию):
+
+users:
+
+id (целое число, вероятно, должно быть UUID)
+telegram_id (строка)
+username (строка)
+first_name (строка)
+last_name (строка)
+created_at (метка времени)
+updated_at (метка времени)
+
+
+sessions:
+
+id (тип untd, предполагаем UUID)
+user_id (целое число, вероятно, должно быть UUID)
+telegram_id (строка)
+type (строка, содержит oneshot, multishot, edit, price_update, split_excel)
+status (строка, содержит active, completed, cancelled)
+created_at (метка времени)
+updated_at (метка времени)
+completed_at (метка времени)
+
+
+inventory_items:
+
+id (целое число, вероятно, должно быть UUID)
+session_id (тип untd, предполагаем UUID)
+name (строка)
+slug (строка)
+quantity (целое число)
+sell_prices (JSON)
+buy_prices (JSON)
+avg_sell (целое число)
+avg_buy (целое число)
+market_url (текст)
+source (строка, содержит screenshot, excel)
+created_at (метка времени)
+updated_at (метка времени)
+
+
+
+Предлагаемая схема (из предыдущих обсуждений):
+
+Удалить oneshot из type в sessions.
+Добавить photoLimit (целое число, по умолчанию 16 для multishot).
+Добавить expiresAt (метка времени) для срока жизни сессии.
+Использовать UUID для id, user_id, session_id вместо целых чисел.
+
+Различия:
+
+Текущая схема использует целые числа для id, а не UUID (что не соответствует @shared/schema с UUID).
+Отсутствуют photoLimit и expiresAt в sessions.
+type включает oneshot, который нужно удалить.
+
+
+Улучшенный промпт для разработчика
+Промпт:
+"Необходимо обновить базу данных и код бота для удаления режима oneshot, добавления лимита скриншотов (photoLimit) и соответствия текущей схеме таблиц. Текущая структура базы данных:
+
+users:
+
+id (целое число, предполагаем заменить на UUID)
+telegram_id (строка)
+username (строка)
+first_name (строка)
+last_name (строка)
+created_at (метка времени)
+updated_at (метка времени)
+
+
+sessions:
+
+id (тип untd, заменить на UUID)
+user_id (целое число, заменить на UUID)
+telegram_id (строка)
+type (строка, содержит oneshot, multishot, edit, price_update, split_excel)
+status (строка, содержит active, completed, cancelled)
+created_at (метка времени)
+updated_at (метка времени)
+completed_at (метка времени)
+
+
+inventory_items:
+
+id (целое число, заменить на UUID)
+session_id (тип untd, заменить на UUID)
+name (строка)
+slug (строка)
+quantity (целое число)
+sell_prices (JSON)
+buy_prices (JSON)
+avg_sell (целое число)
+avg_buy (целое число)
+market_url (текст)
+source (строка, содержит screenshot, excel)
+created_at (метка времени)
+updated_at (метка времени)
+
+
+
+Задачи:
+
+Обновление схемы базы данных:
+
+Заменить id, user_id, session_id на тип UUID с использованием gen_random_uuid() (например, id UUID PRIMARY KEY DEFAULT gen_random_uuid()).
+Удалить oneshot из type в sessions, оставив multishot, edit, price_update, split_excel.
+Добавить поле photoLimit в sessions (тип INTEGER, значение по умолчанию 16 для multishot).
+Добавить поле expiresAt в sessions (тип TIMESTAMP WITH TIME ZONE) для срока жизни сессии.
+SQL-миграция:
+sql-- Обновление users
+ALTER TABLE users ALTER COLUMN id TYPE UUID USING (gen_random_uuid());
+ALTER TABLE users ADD CONSTRAINT users_pk PRIMARY KEY (id);
+
+-- Обновление sessions
+ALTER TABLE sessions ALTER COLUMN id TYPE UUID USING (gen_random_uuid());
+ALTER TABLE sessions ALTER COLUMN user_id TYPE UUID USING (gen_random_uuid());
+ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_type_check;
+ALTER TABLE sessions ADD CONSTRAINT sessions_type_check CHECK (type IN ('multishot', 'edit', 'price_update', 'split_excel'));
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS photoLimit INTEGER NOT NULL DEFAULT 16;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expiresAt TIMESTAMP WITH TIME ZONE;
+ALTER TABLE sessions ADD CONSTRAINT sessions_pk PRIMARY KEY (id);
+
+-- Обновление inventory_items
+ALTER TABLE inventory_items ALTER COLUMN id TYPE UUID USING (gen_random_uuid());
+ALTER TABLE inventory_items ALTER COLUMN session_id TYPE UUID USING (gen_random_uuid());
+ALTER TABLE inventory_items ADD CONSTRAINT inventory_items_pk PRIMARY KEY (id);
+
+
+
+Обновление storage.ts:
+
+Обновить интерфейс IStorage, добавив getExpiredSessions(currentDate: Date): Promise<Session[]>.
+Обеспечить поддержку photoLimit и expiresAt в createSession и getSession.
+Реализовать getExpiredSessions для выборки сессий с expiresAt <= currentDate и статусом active.
+
+
+Обновление @shared/schema.ts:
+
+Обновить Session и InsertSession, убрав oneshot из type и добавив photoLimit и expiresAt:
+typescriptexport interface Session {
+  id: string;
+  userId: string;
+  telegramId: string;
+  type: 'multishot' | 'edit' | 'price_update' | 'split_excel';
+  status: 'active' | 'completed' | 'cancelled';
+  createdAt: Date;
+  completedAt: Date | null;
+  photoLimit: number;
+  expiresAt: Date | null;
+}
+
+export interface InsertSession {
+  userId: string;
+  telegramId: string;
+  type: 'multishot' | 'edit' | 'price_update' | 'split_excel';
+  status?: 'active' | 'completed' | 'cancelled';
+  createdAt?: Date;
+  completedAt?: Date | null;
+  photoLimit: number;
+  expiresAt?: Date | null;
+}
+
+
+
+Обновление bot.ts:
+
+В startSession: Установить type = 'multishot', photoLimit = 16, и expiresAt (например, +1 час).
+В bot.on('photo') и processPhotoQueue: Использовать photoLimit из сессии для ограничения скриншотов.
+Добавить проверку expiresAt и фоновую очистку устаревших сессий.
+
+
+
+Требования:
+
+Сделать бэкап базы данных перед миграцией.
+Протестировать: создание сессии multishot, отправка 16 скриншотов, автоматическое завершение по лимиту или истечению времени.
+Убедиться, что старые сессии с oneshot не ломают логику (можно очистить их вручную: DELETE FROM sessions WHERE type = 'oneshot';).
+
+Если есть скриншот старой таблицы или дополнительные детали, приложи их для уточнения."
+
+Примечания
+
+UUID вместо целых чисел: Текущая схема использует целые числа для id, но @shared/schema предполагает UUID. Миграция требует преобразования данных, что может быть сложным, если уже есть записи. Если это проблема, можно временно оставить целые числа, но лучше перейти на UUID для единообразия.
+Скриншот: Если ты пришлешь скриншот, я смогу точнее сопоставить старую таблицу и предложить более специфичные миграции.
+Тестирование: После миграции важно проверить целостность ссылок (user_id, session_id) и корректность новых полей.

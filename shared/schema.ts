@@ -17,12 +17,12 @@ export const sessions = pgTable("sessions", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   userId: varchar("user_id").references(() => users.id, { onDelete: "cascade" }).notNull(),
   telegramId: text("telegram_id").notNull(),
-  type: text("type", { enum: ["oneshot", "multishot", "edit", "price_update", "split_excel"] }).notNull(),
+  type: text("type", { enum: ["multishot", "edit", "price_update", "split_excel"] }).notNull(),
   status: text("status", { enum: ["active", "completed", "cancelled"] }).default("active").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   completedAt: timestamp("completed_at"),
 }, (table) => ({
-  typeCheck: check("type_check", sql`${table.type} IN ('oneshot', 'multishot', 'edit', 'price_update', 'split_excel')`),
+  typeCheck: check("type_check", sql`${table.type} IN ('multishot', 'edit', 'price_update', 'split_excel')`),
   statusCheck: check("status_check", sql`${table.status} IN ('active', 'completed', 'cancelled')`),
 }));
 
