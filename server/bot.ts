@@ -20,10 +20,21 @@ function parseTextToItems(text: string): { name: string; quantity: number }[] {
   });
 }
 
+// Функция для безопасной очистки ресурсов сессии
+function cleanupSession(ctx: BotContext) {
+  const telegramId = ctx.from?.id.toString();
+  if (telegramId) {
+    photoQueue.delete(telegramId);
+    cancellationRequests.delete(telegramId);
+    console.log(`[Cleanup] Cleared resources for user ${telegramId}`);
+  }
+  ctx.session = {};
+}
+
 // --- ФУНКЦИЯ 2: Центральная "фабрика" обработки предметов ---
 async function processRawItems(ctx: BotContext, rawItems: { name: string; quantity: number }[]) {
-  if (!ctx.session?.sessionId) {
-    await ctx.reply('Произошла ошибка сессии. Пожалуйста, начните заново /start');
+  if (!ctx.session || !ctx.session.sessionId) {
+    await ctx.reply('❌ Сессия не инициализирована. Пожалуйста, начните заново /start');
     return;
   }
   
@@ -49,7 +60,7 @@ async function processRawItems(ctx: BotContext, rawItems: { name: string; quanti
       } else {
         const marketItem = await processItemForMarket(correctedName);
         const newItem: InsertInventoryItem = {
-          sessionId: ctx.session!.sessionId!,
+          sessionId: ctx.session.sessionId,
           name: correctedName,
           quantity: rawItem.quantity,
           slug: marketItem?.slug || null,
@@ -503,18 +514,15 @@ bot.action('complete_session', async (ctx) => {
 bot.action('cancel_session', async (ctx) => {
   const telegramId = ctx.from?.id.toString();
   if (telegramId) {
-    if (photoQueue.has(telegramId)) {
-      photoQueue.delete(telegramId);
-    }
     cancellationRequests.add(telegramId);
     console.log(`[STOP] Cancellation requested for user ${telegramId} via button.`);
   }
-  // Вызываем вашу существующую функцию отмены сессии, если она есть
-  // Если нет, то просто отменяем в базе и сбрасываем локальную
+  
   if (ctx.session?.sessionId) {
     await storage.updateSessionStatus(ctx.session.sessionId, 'cancelled');
   }
-  ctx.session = {};
+  
+  cleanupSession(ctx);
   await ctx.answerCbQuery();
   await ctx.reply('❌ Сессия отменена. Очередь обработки очищена. Нажмите /start, чтобы начать новую.');
 });
@@ -886,11 +894,13 @@ async function completeSession(ctx: BotContext) {
         return;
       }
 
-      ctx.session!.lastExport = {
-        excel: excelBuffer.toString('base64'),
-        text: textContent,
-        itemsCount: items.length
-      };
+      if (ctx.session) {
+        ctx.session.lastExport = {
+          excel: excelBuffer.toString('base64'),
+          text: textContent,
+          itemsCount: items.length
+        };
+      }
       await storage.updateSessionStatus(sessionId, 'completed');
 
       const keyboard = Markup.inlineKeyboard([
@@ -911,44 +921,52 @@ async function completeSession(ctx: BotContext) {
   } catch (error) {
     console.error('Error completing session:', error);
     await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
-    // ВСТАВКА: Очистка ресурсов в случае ошибки
-    const telegramId = ctx.from?.id.toString();
-    if (telegramId) {
-      photoQueue.delete(telegramId);
-      cancellationRequests.delete(telegramId);
-    }
-    ctx.session = {};
+    cleanupSession(ctx);
   }
 }
 
 // Handle photos
 async function processPhotoQueue(ctx: BotContext) {
   const telegramId = ctx.from?.id.toString();
-  const originalSessionId = ctx.session?.sessionId;
-
-  if (!telegramId || !originalSessionId) {
-    await ctx.reply('❌ Ошибка: сессия или пользователь не найдены.');
+  
+  if (!telegramId || !ctx.session || !ctx.session.sessionId) {
+    console.error(`[Photo Queue] Session not initialized for user ${telegramId}`);
+    await ctx.reply('❌ Сессия не инициализирована. Нажмите /start, чтобы начать заново.');
     return;
   }
 
+  if (processingLock.has(telegramId)) {
+    console.log(`[Photo Queue] Already processing for user ${telegramId}`);
+    return;
+  }
+
+  const originalSessionId = ctx.session.sessionId;
+
   // Проверка режима сессии
-  if (!ctx.session?.mode) {
-    console.error(`[Worker] Invalid session mode for user ${telegramId}`);
+  if (!ctx.session.mode) {
+    console.error(`[Photo Queue] Invalid session mode for user ${telegramId}`);
     await ctx.reply('❌ Ошибка: режим сессии не определен. Нажмите /start, чтобы начать заново.');
     return;
   }
 
-  // Определяем лимит скриншотов из сессии в БД
+  // Кэшируем данные сессии перед циклом для оптимизации
   const sessionData = await storage.getSession(originalSessionId);
-  const MAX_SCREENSHOTS = sessionData?.photoLimit || 16;
+  if (!sessionData || sessionData.status !== 'active') {
+    await ctx.reply('❌ Сессия была завершена или отменена. Очередь скриншотов очищена.');
+    cleanupSession(ctx);
+    return;
+  }
+  
+  const MAX_SCREENSHOTS = sessionData.photoLimit || 16;
   if (MAX_SCREENSHOTS === 0) {
-    console.error(`[Worker] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
+    console.error(`[Photo Queue] Invalid photo limit for user ${telegramId}: ${ctx.session.mode}`);
     await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
     return;
   }
 
   // Устанавливаем блокировку
   processingLock.add(telegramId);
+  console.log(`[Photo Queue] Started processing for user ${telegramId}, limit: ${MAX_SCREENSHOTS}`);
 
   try {
     while (photoQueue.has(telegramId) && photoQueue.get(telegramId)!.length > 0) {
@@ -960,12 +978,16 @@ async function processPhotoQueue(ctx: BotContext) {
         break;
       }
 
-      // ПРОВЕРКА №2: Отложенная проверка статуса сессии в БД
-      const currentSession = await storage.getSession(originalSessionId);
-      if (!currentSession || currentSession.status !== 'active') {
-        await ctx.reply('❌ Сессия была завершена или отменена. Очередь скриншотов очищена.');
-        photoQueue.delete(telegramId);
-        break;
+      // ПРОВЕРКА №2: Используем кэшированные данные сессии (оптимизация)
+      // Периодически проверяем статус только каждые 5 скриншотов
+      const currentScreenshotCount = ctx.session?.screenshotCount || 0;
+      if (currentScreenshotCount % 5 === 0) {
+        const currentSession = await storage.getSession(originalSessionId);
+        if (!currentSession || currentSession.status !== 'active') {
+          await ctx.reply('❌ Сессия была завершена или отменена. Очередь скриншотов очищена.');
+          cleanupSession(ctx);
+          break;
+        }
       }
 
       // ПРОВЕРКА №3: Проверка лимита скриншотов (должна быть уже обработана при добавлении в очередь)
@@ -980,7 +1002,7 @@ async function processPhotoQueue(ctx: BotContext) {
 
       // Внутренний try...catch для обработки ОДНОГО фото
       try {
-        console.log(`[Worker] Processing photo for user ${telegramId}, mode: ${ctx.session!.mode}, screenshotCount: ${(ctx.session?.screenshotCount || 0) + 1}/${MAX_SCREENSHOTS}`);
+        console.log(`[Worker] Processing photo for user ${telegramId}, mode: ${ctx.session.mode}, screenshotCount: ${(ctx.session.screenshotCount || 0) + 1}/${MAX_SCREENSHOTS}`);
         const remainingInQueue = photoQueue.get(telegramId)?.length || 0;
         const loadingMessage = await ctx.reply(`🔄 Анализирую скриншот... (${remainingInQueue} в очереди)`);
 
@@ -1103,9 +1125,13 @@ async function processPhotoQueue(ctx: BotContext) {
           ]);
           await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
         }
-      } catch (error) {
-        console.error('Ошибка при обработке фото из очереди:', error);
-        await ctx.reply('❌ Произошла ошибка при анализе скриншота. Проверьте качество изображения или попробуйте снова.');
+      } catch (error: any) {
+        console.error(`[Photo] Error analyzing screenshot for user ${telegramId}:`, error);
+        if (error.message?.includes('ApiError')) {
+          await ctx.reply('❌ Ошибка API при анализе скриншота. Попробуйте позже или обратитесь к администратору.');
+        } else {
+          await ctx.reply('❌ Произошла ошибка при анализе скриншота. Проверьте качество изображения или попробуйте снова.');
+        }
       }
     }
   } finally {
@@ -1113,6 +1139,7 @@ async function processPhotoQueue(ctx: BotContext) {
     if (cancellationRequests.has(telegramId)) {
       cancellationRequests.delete(telegramId);
     }
+    console.log(`[Photo Queue] Finished processing for user ${telegramId}`);
   }
 }
 
