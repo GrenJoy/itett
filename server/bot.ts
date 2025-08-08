@@ -113,8 +113,13 @@ interface BotContext extends Context {
     waitingForSplitPrice?: boolean;
     splitThreshold?: number;
     mode?: 'oneshot' | 'multishot' | 'edit' | 'price_update' | 'split_excel';
-    screenshotProcessed?: boolean; // Flag for oneshot
-    screenshotCount?: number; // For tracking in multishot/edit
+    screenshotProcessed?: boolean;
+    screenshotCount?: number;
+    lastExport?: {
+      excel: string;
+      text: string;
+      itemsCount: number;
+    }
   };
 }
 
@@ -124,9 +129,7 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 
 const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
 
-// Session middleware (simple in-memory for now)
 const sessions = new Map<string, any>();
-
 bot.use((ctx, next) => {
   const chatId = ctx.chat?.id.toString();
   if (chatId) {
@@ -388,38 +391,46 @@ bot.action('download_txt', async (ctx) => {
   // @ts-ignore
   const lastExport = ctx.session?.lastExport;
   if (!lastExport?.text) {
-    await ctx.answerCbQuery('Данные для экспорта устарели. Начните новую сессию.', { show_alert: true });
+    await ctx.answerCbQuery('Данные для экспорта устарели.', { show_alert: true });
+    await ctx.editMessageReplyMarkup(
+      Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]]).reply_markup
+    );
     return;
   }
-  
   await ctx.answerCbQuery();
-  
   const textBuffer = Buffer.from(lastExport.text, 'utf-8');
   await ctx.replyWithDocument(
     { source: textBuffer, filename: `inventory_${Date.now()}.txt` },
     { caption: `📋 Ваш инвентарь в .txt\n📊 Предметов: ${lastExport.itemsCount}` }
   );
-  // Очищаем сессию после скачивания
-  ctx.session = {}; 
+  ctx.session = {}; // ПОЛНАЯ ОЧИСТКА СЕССИИ
+  await ctx.editMessageText(
+    `✅ Файл .txt отправлен!\n\nНажмите /start, чтобы создать новую сессию.`,
+    Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+  );
 });
 
 bot.action('download_xlsx', async (ctx) => {
   // @ts-ignore
   const lastExport = ctx.session?.lastExport;
   if (!lastExport?.excel) {
-    await ctx.answerCbQuery('Данные для экспорта устарели. Начните новую сессию.', { show_alert: true });
+    await ctx.answerCbQuery('Данные для экспорта устарели.', { show_alert: true });
+    await ctx.editMessageReplyMarkup(
+      Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]]).reply_markup
+    );
     return;
   }
-
   await ctx.answerCbQuery();
-  
   const excelBuffer = Buffer.from(lastExport.excel, 'base64');
   await ctx.replyWithDocument(
     { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
     { caption: `📊 Ваш инвентарь в .xlsx\n📊 Предметов: ${lastExport.itemsCount}` }
   );
-  // Очищаем сессию после скачивания
-  ctx.session = {};
+  ctx.session = {}; // ПОЛНАЯ ОЧИСТКА СЕССИИ
+  await ctx.editMessageText(
+    `✅ Файл .xlsx отправлен!\n\nНажмите /start, чтобы создать новую сессию.`,
+    Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+  );
 });
 
 bot.action('back_to_menu', async (ctx) => {
@@ -626,132 +637,183 @@ async function startSplitExcelSession(ctx: BotContext) {
   );
 }
 
-async function completeSession(ctx: BotContext) {
-  // Сразу отвечаем на нажатие кнопки, если оно было
-  if (ctx.callbackQuery) {
-    await ctx.answerCbQuery();
-  }
-
+typescriptasync function completeSession(ctx: BotContext) {
+  if (ctx.callbackQuery) { await ctx.answerCbQuery(); }
   if (!ctx.session?.sessionId) {
     await ctx.reply('Нет активной сессии для завершения.');
     return;
   }
 
   const sessionId = ctx.session.sessionId;
-  // --- ВОЗВРАЩАЕМ session, он нужен для проверки типа и режима ---
-  const session = await storage.getSession(sessionId); 
+  const session = await storage.getSession(sessionId);
   const items = await storage.getItemsBySessionId(sessionId);
 
-  // Обработка пустой сессии
+  // Исключаем split_excel из стандартной логики завершения
+  if (session?.type === 'split_excel') {
+    await ctx.reply('❌ Для режима разделения Excel используйте ввод пороговой цены.');
+    return;
+  }
+
   if (items.length === 0) {
     await ctx.reply('❌ В сессии нет предметов для экспорта. Сессия завершена.');
     await storage.updateSessionStatus(sessionId, 'completed');
-    ctx.session = {}; // Полностью очищаем сессию
+    ctx.session = {};
     return;
   }
 
   try {
-    // =======================================================
-    //           ГЛАВНАЯ ЛОГИКА: ПРОВЕРЯЕМ РЕЖИМ
-    // =======================================================
+    // Генерируем Excel-файл
+    const excelBuffer = await generateExcelBuffer(items);
+    const MAX_FILE_SIZE = 2 * 1024 * 1024;
 
-    // --- ЛОГИКА ДЛЯ ONESHOT (АВТОМАТ) ---
-    // Мы используем session?.type, чтобы быть уверенными, что работаем с данными из БД
-    if (session?.type === 'oneshot') {
-      const excelBuffer = await generateExcelBuffer(items);
-      
-      // ВОЗВРАЩАЕМ ВАЖНУЮ ПРОВЕРКУ РАЗМЕРА ФАЙЛА
-      const MAX_FILE_SIZE = 2 * 1024 * 1024;
-      if (excelBuffer.byteLength > MAX_FILE_SIZE) {
-        // ... (вся ваша логика для слишком большого файла остается здесь)
+    // Проверка размера Excel-файла
+    if (excelBuffer.byteLength > MAX_FILE_SIZE) {
+      const fileSizeMB = (excelBuffer.byteLength / (1024 * 1024)).toFixed(2);
+      await storage.updateSessionStatus(sessionId, 'completed');
+
+      // Генерируем текстовый файл как запасной вариант
+      let textContent;
+      try {
+        textContent = generateTextContent(items);
+      } catch (error) {
+        console.error('Error generating text content:', error);
+        await ctx.reply('❌ Ошибка при создании текстового файла.');
+        ctx.session = {};
         return;
       }
-      
+
+      const textBuffer = Buffer.from(textContent, 'utf-8');
+
+      // Проверка размера текстового файла
+      if (textBuffer.byteLength > MAX_FILE_SIZE) {
+        const textFileSizeMB = (textBuffer.byteLength / (1024 * 1024)).toFixed(2);
+        const tooLargeMessage = `⚠️ *Файлы слишком большие!*\n\n` +
+          `📊 Предметов в сессии: ${items.length}\n` +
+          `📁 Размер Excel: ${fileSizeMB} MB (макс. 2 MB)\n` +
+          `📄 Размер текста: ${textFileSizeMB} MB (макс. 2 MB)\n\n` +
+          `💡 *Рекомендации:*\n` +
+          `• Используйте несколько сессий для большого инвентаря.\n\n` +
+          `Сессия завершена без отправки файлов.`;
+
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(tooLargeMessage, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+          });
+        } else {
+          await ctx.reply(tooLargeMessage, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+          });
+        }
+        ctx.session = {};
+        return;
+      }
+
+      ctx.session = {};
+
+      const tooLargeMessage = `⚠️ *Файл Excel слишком большой!*\n\n` +
+        `📊 Предметов в сессии: ${items.length}\n` +
+        `📁 Размер файла: ${fileSizeMB} MB (макс. 2 MB)\n\n` +
+        `💡 *Рекомендации:*\n` +
+        `• Используйте несколько сессий для большого инвентаря.\n` +
+        `• Текстовый файл отправлен как запасной вариант.\n\n` +
+        `Сессия завершена.`;
+
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText(tooLargeMessage, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+        });
+      } else {
+        await ctx.reply(tooLargeMessage, {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+        });
+      }
+
+      await ctx.replyWithDocument(
+        { source: textBuffer, filename: `inventory_${Date.now()}.txt` },
+        { caption: `📋 Ваш инвентарь в .txt (запасной вариант)\n📊 Предметов: ${items.length}` }
+      );
+      return;
+    }
+
+    // Логика для oneshot
+    if (session?.type === 'oneshot') {
       await storage.updateSessionStatus(sessionId, 'completed');
       ctx.session = {};
 
-      // Отправляем пользователю итоговый файл Excel по умолчанию
-      await ctx.reply(
-        `✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}`
-      );
+      await ctx.reply(`✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}`);
       await ctx.replyWithDocument(
         { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
-        { caption: `📋 Ваш инвентарь Warframe\n📊 Предметов: ${items.length}\n\n🆕 Для новой сессии нажмите /start` }
+        { caption: `📋 Ваш инвентарь Warframe\n📊 Предметов: ${items.length}` }
       );
-
-    // --- ЛОГИКА ДЛЯ ВСЕХ ОСТАЛЬНЫХ РЕЖИМОВ (РУЧНОЕ УПРАВЛЕНИЕ) ---
     } else {
-      // Генерируем оба формата
-      const excelBuffer = await generateExcelBuffer(items);
-      const textContent = generateTextContent(items);
-
-      // ВОЗВРАЩАЕМ ВАЖНУЮ ПРОВЕРКУ РАЗМЕРА ФАЙЛА
-      const MAX_FILE_SIZE = 2 * 1024 * 1024;
-      if (excelBuffer.byteLength > MAX_FILE_SIZE) {
-        // ... (вся ваша логика для слишком большого файла остается здесь)
+      // Логика для multishot, edit, price_update
+      let textContent;
+      try {
+        textContent = generateTextContent(items);
+      } catch (error) {
+        console.error('Error generating text content:', error);
+        await ctx.reply('❌ Ошибка при создании текстового файла. Попробуйте скачать Excel.');
         return;
       }
 
-      // @ts-ignore
+      const textBuffer = Buffer.from(textContent, 'utf-8');
+      if (textBuffer.byteLength > MAX_FILE_SIZE) {
+        const textFileSizeMB = (textBuffer.byteLength / (1024 * 1024)).toFixed(2);
+        await storage.updateSessionStatus(sessionId, 'completed');
+        ctx.session = {};
+
+        const tooLargeMessage = `⚠️ *Текстовый файл слишком большой!*\n\n` +
+          `📊 Предметов в сессии: ${items.length}\n` +
+          `📄 Размер текста: ${textFileSizeMB} MB (макс. 2 MB)\n\n` +
+          `💡 *Рекомендации:*\n` +
+          `• Используйте несколько сессий для большого инвентаря.\n\n` +
+          `Сессия завершена без отправки файлов.`;
+
+        if (ctx.callbackQuery) {
+          await ctx.editMessageText(tooLargeMessage, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+          });
+        } else {
+          await ctx.reply(tooLargeMessage, {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
+          });
+        }
+        return;
+      }
+
       ctx.session.lastExport = {
         excel: excelBuffer.toString('base64'),
         text: textContent,
         itemsCount: items.length
       };
-
       await storage.updateSessionStatus(sessionId, 'completed');
-      
+
       const keyboard = Markup.inlineKeyboard([
         Markup.button.callback('📄 Скачать .txt', 'download_txt'),
         Markup.button.callback('📊 Скачать .xlsx', 'download_xlsx')
       ]);
 
-      // ВОЗВРАЩАЕМ ВАШУ ЛОГИКУ ДЛЯ РАЗНЫХ СООБЩЕНИЙ
       let messageText = `✅ Сессия завершена!\nНайдено предметов: ${items.length}.\n\nВыберите формат для скачивания:`;
       if (session?.type === 'price_update') {
         messageText = `✅ Цены обновлены!\nНайдено предметов: ${items.length}.\n\nВыберите формат для скачивания:`;
-      } else if (session?.type === 'split_excel') {
-        // Для split_excel логика немного другая, но для унификации пока оставим так
-        messageText = `✅ Excel файл разделен!\nНайдено предметов: ${items.length}.\n\nВыберите формат для скачивания:`;
       }
-      
-      // Отправляем или редактируем сообщение
+
       if (ctx.callbackQuery) {
-        await ctx.editMessageText(messageText, keyboard);
+        await ctx.editMessageText(messageText, { reply_markup: keyboard.reply_markup });
       } else {
         await ctx.reply(messageText, keyboard);
       }
     }
-
   } catch (error) {
     console.error('Error completing session:', error);
     await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
   }
-}
-
-async function cancelSession(ctx: BotContext) {
-  if (!ctx.session?.sessionId) {
-    await ctx.answerCbQuery('Нет активной сессии');
-    return;
-  }
-
-  const sessionId = ctx.session.sessionId;
-  await storage.updateSessionStatus(sessionId, 'cancelled');
-  
-  ctx.session.sessionId = undefined;
-  ctx.session.waitingForExcel = false;
-  ctx.session.waitingForPriceUpdate = false;
-  ctx.session.waitingForSplitPrice = false;
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
-  ]);
-
-  await ctx.editMessageText(
-    '❌ Сессия отменена\n\n' +
-    'Все данные сессии удалены. Вы можете создать новую сессию.',
-    keyboard
-  );
 }
 
 // Handle photos
@@ -1195,7 +1257,7 @@ async function handleExcelSplit(ctx: BotContext) {
 
     // Complete session and cleanup
     await storage.updateSessionStatus(sessionId, 'completed');
-    ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false, waitingForSplitPrice: false };
+    ctx.session = {};
 
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
@@ -1229,7 +1291,7 @@ async function handleExcelSplit(ctx: BotContext) {
 
 // Handle text messages (for split price threshold)
 bot.on('text', async (ctx) => {
-  // Сначала обрабатываем сценарий с порогом цены (старая логика)
+  // Обработка порога цены для split_excel
   if (ctx.session?.waitingForSplitPrice) {
     const priceText = ctx.message.text.trim();
     const price = parseFloat(priceText);
@@ -1242,7 +1304,7 @@ bot.on('text', async (ctx) => {
     await handleExcelSplit(ctx);
     return;
   }
-  
+
   // Проверяем, активна ли сессия и подходит ли режим для добавления текстом
   if (!ctx.session?.sessionId || (ctx.session.mode !== 'multishot' && ctx.session.mode !== 'edit')) {
     if (!ctx.message.text.startsWith('/')) {
@@ -1254,76 +1316,20 @@ bot.on('text', async (ctx) => {
   try {
     const loadingMessage = await ctx.reply('🔄 Обрабатываю ваш текст...');
 
-    const text = ctx.message.text;
-    const lines = text.split('\n').filter(line => line.trim() !== '');
-
-    const itemsFromText: { name: string, quantity: number }[] = lines.map(line => {
-      const parts = line.split('|');
-      const name = parts[0].trim();
-      const quantity = parts.length > 1 && !isNaN(parseInt(parts[1])) ? parseInt(parts[1].trim()) : 1;
-      return { name, quantity };
-    });
+    // Парсим текст с помощью вашей функции
+    const itemsFromText = parseTextToItems(ctx.message.text);
 
     if (itemsFromText.length === 0) {
       await ctx.deleteMessage(loadingMessage.message_id);
-      await ctx.reply('Не найдено предметов для добавления в вашем сообщении.');
+      await ctx.reply('Не найдено предметов для добавления в вашем сообщении.\n' + '💡 Отправьте текст в формате: Название|Количество, например:\n' + 'Висп Прайм: Каркас|2\nСевагот Прайм: Система|1' );
       return;
     }
 
-    const consolidatedItems = new Map<string, InsertInventoryItem>();
-    const unrecognizedItems: string[] = [];
-    
-    for (const rawItem of itemsFromText) {
-      const correctedName = getCorrectedItemName(rawItem.name);
-      if (correctedName) {
-        if (consolidatedItems.has(correctedName)) {
-          consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
-        } else {
-          const marketItem = await processItemForMarket(correctedName);
-          const newItem: InsertInventoryItem = {
-            sessionId: ctx.session!.sessionId!, name: correctedName, quantity: rawItem.quantity,
-            slug: marketItem?.slug || null, sellPrices: marketItem?.sellPrices || [], buyPrices: marketItem?.buyPrices || [],
-            avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0, avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
-            marketUrl: marketItem?.marketUrl || null, source: 'excel' as const
-          };
-          consolidatedItems.set(correctedName, newItem);
-        }
-      } else {
-        unrecognizedItems.push(rawItem.name);
-      }
-    }
+    // Обрабатываем элементы с помощью вашей функции processRawItems
+    await processRawItems(ctx, itemsFromText);
 
-    const newEnrichedItems = Array.from(consolidatedItems.values());
-    const existingItems = await storage.getItemsBySessionId(ctx.session!.sessionId!);
-    const finalItems = consolidateItems(newEnrichedItems, existingItems);
-
-    await storage.deleteItemsBySessionId(ctx.session!.sessionId!);
-    await storage.createInventoryItems(finalItems);
-    
-    const finalTotalItems = await storage.getItemsBySessionId(ctx.session!.sessionId!);
-    
-    let responseText = `✅ Текст обработан!\n`;
-    responseText += `⚙️ Опознано и добавлено: ${newEnrichedItems.length}\n`;
-    if (unrecognizedItems.length > 0) {
-      responseText += `⚠️ Не удалось опознать: ${unrecognizedItems.length}\n`;
-    }
-    responseText += `📋 Всего в сессии: ${finalTotalItems.length}\n\n`;
-
-    if (unrecognizedItems.length > 0) {
-      responseText += `*Неопознанные предметы:*\n`;
-      for (const itemName of unrecognizedItems) {
-        responseText += `• \`${itemName}\`\n`;
-      }
-    }
-    
+    // Удаляем сообщение о загрузке, так как processRawItems уже отправляет ответ
     await ctx.deleteMessage(loadingMessage.message_id);
-    
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
-      [Markup.button.callback('❌ Отменить', 'cancel_session')]
-    ]);
-    
-    await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
 
   } catch (error) {
     console.error('Error processing text input:', error);
