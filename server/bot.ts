@@ -6,6 +6,9 @@ import { consolidateItems, consolidateNewItems } from './services/item-consolida
 import { type InsertInventoryItem } from '@shared/schema';
 import { processItemForMarket, getCorrectedItemName } from './services/warframe-market';
 // Вверху файла bot.ts
+const MAX_SCREENSHOTS_PER_SESSION = 16;
+const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
+const SESSION_TIMEOUT_MS = 60 * 60 * 1000; // 1 час
 const processingLock = new Set<string>();
 const photoQueue = new Map<string, string[]>();
 const cancellationRequests = new Set<string>(); // Для немедленной остановки обработки
@@ -161,16 +164,16 @@ bot.start(async (ctx) => {
     return;
   }
 
+  // Принудительная остановка текущей обработки
+  if (photoQueue.has(telegramId)) {
+    cancellationRequests.add(telegramId);
+    photoQueue.delete(telegramId);
+    console.log(`[STOP] Forced stop of photo queue for user ${telegramId} via /start.`);
+  }
+
   // Проверяем существующую активную сессию
   const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
-    // Останавливаем текущую обработку
-    if (photoQueue.has(telegramId)) {
-      photoQueue.delete(telegramId);
-    }
-    cancellationRequests.add(telegramId);
-    console.log(`[STOP] Force completing session ${existingSession.id} for user ${telegramId} via /start.`);
-    
     // Проверяем есть ли обработанные данные в сессии
     const existingItems = await storage.getItemsBySessionId(existingSession.id);
     if (existingItems.length > 0) {
@@ -200,8 +203,7 @@ bot.start(async (ctx) => {
     }
     
     // Сбрасываем локальную сессию
-    ctx.session = {};
-    cancellationRequests.delete(telegramId);
+    cleanupSession(ctx);
   }
 
   // Создаем или получаем пользователя
@@ -214,6 +216,27 @@ bot.start(async (ctx) => {
       lastName: ctx.from?.last_name,
     });
   }
+
+  const mainKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🆕 Создать новую сессию', 'create_session')],
+    [Markup.button.callback('❓ Помощь', 'help')]
+  ]);
+
+  await ctx.reply(
+    '🎮 *Warframe Inventory Analyzer*\n\n' +
+    'Добро пожаловать в бота для анализа инвентаря Warframe!\n\n' +
+    '🔍 *Возможности:*\n' +
+    '• Анализ скриншотов инвентаря\n' +
+    '• Получение актуальных цен с Warframe Market\n' +
+    '• Экспорт данных в Excel файлы\n' +
+    '• Объединение дубликатов предметов\n' +
+    '• 💰 Обновление цен в старых Excel файлах\n' +
+    '• 📊 Разделение Excel по ценовым порогам\n' +
+    '• Создал: GrendematriX. Для связи discord:grenjoy\n\n' +
+    '*Выберите действие:*',
+    { parse_mode: 'Markdown', ...mainKeyboard }
+  );
+});
 
   const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🆕 Создать новую сессию', 'create_session')],
@@ -527,7 +550,7 @@ bot.action('cancel_session', async (ctx) => {
   await ctx.reply('❌ Сессия отменена. Очередь обработки очищена. Нажмите /start, чтобы начать новую.');
 });
 
-async function startSession(ctx: BotContext) {
+async function startSession(ctx: BotContext, mode: Session['type']) {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
 
@@ -542,13 +565,13 @@ async function startSession(ctx: BotContext) {
   if (!user) return;
 
   // Create new multishot session
-  const session = await storage.createSession({
-    userId: user.id,
+    const session = await storage.createSession({
+    userId: (await storage.getUserByTelegramId(telegramId))!.id,
     telegramId,
-    type: 'multishot',
+    type: mode,
     status: 'active',
-    photoLimit: 16,
-    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
+    // БД сама подставит photoLimit: 16 для multishot/edit
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 час
   });
 
   if (!session || !session.id) {
@@ -724,12 +747,7 @@ async function completeSession(ctx: BotContext) {
   // ВСТАВКА: Проверка статуса сессии перед обработкой
   if (!session || session.status !== 'active') {
     await ctx.reply('❌ Сессия уже завершена или отменена.');
-    const telegramId = ctx.from?.id.toString();
-    if (telegramId) {
-      photoQueue.delete(telegramId);
-      cancellationRequests.delete(telegramId);
-    }
-    ctx.session = {};
+    cleanupSession(ctx);
     return;
   }
 
@@ -744,13 +762,7 @@ async function completeSession(ctx: BotContext) {
   if (items.length === 0) {
     await ctx.reply('❌ В сессии нет предметов для экспорта. Сессия завершена.');
     await storage.updateSessionStatus(sessionId, 'completed');
-    // ВСТАВКА: Очистка ресурсов
-    const telegramId = ctx.from?.id.toString();
-    if (telegramId) {
-      photoQueue.delete(telegramId);
-      cancellationRequests.delete(telegramId);
-    }
-    ctx.session = {};
+    cleanupSession(ctx);
     return;
   }
 
@@ -771,13 +783,7 @@ async function completeSession(ctx: BotContext) {
       } catch (error) {
         console.error('Error generating text content:', error);
         await ctx.reply('❌ Ошибка при создании текстового файла.');
-        // ВСТАВКА: Очистка ресурсов
-        const telegramId = ctx.from?.id.toString();
-        if (telegramId) {
-          photoQueue.delete(telegramId);
-          cancellationRequests.delete(telegramId);
-        }
-        ctx.session = {};
+        cleanupSession(ctx);
         return;
       }
 
@@ -805,23 +811,11 @@ async function completeSession(ctx: BotContext) {
             ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
           });
         }
-        // ВСТАВКА: Очистка ресурсов
-        const telegramId = ctx.from?.id.toString();
-        if (telegramId) {
-          photoQueue.delete(telegramId);
-          cancellationRequests.delete(telegramId);
-        }
-        ctx.session = {};
+        cleanupSession(ctx);
         return;
       }
 
-      // ВСТАВКА: Очистка ресурсов
-      const telegramId = ctx.from?.id.toString();
-      if (telegramId) {
-        photoQueue.delete(telegramId);
-        cancellationRequests.delete(telegramId);
-      }
-      ctx.session = {};
+      cleanupSession(ctx);
 
       const tooLargeMessage = `⚠️ *Файл Excel слишком большой!*\n\n` +
         `📊 Предметов в сессии: ${items.length}\n` +
@@ -858,6 +852,7 @@ async function completeSession(ctx: BotContext) {
       } catch (error) {
         console.error('Error generating text content:', error);
         await ctx.reply('❌ Ошибка при создании текстового файла. Попробуйте скачать Excel.');
+        cleanupSession(ctx);
         return;
       }
 
@@ -865,13 +860,7 @@ async function completeSession(ctx: BotContext) {
       if (textBuffer.byteLength > MAX_FILE_SIZE) {
         const textFileSizeMB = (textBuffer.byteLength / (1024 * 1024)).toFixed(2);
         await storage.updateSessionStatus(sessionId, 'completed');
-        // ВСТАВКА: Очистка ресурсов
-        const telegramId = ctx.from?.id.toString();
-        if (telegramId) {
-          photoQueue.delete(telegramId);
-          cancellationRequests.delete(telegramId);
-        }
-        ctx.session = {};
+        cleanupSession(ctx);
 
         const tooLargeMessage = `⚠️ *Текстовый файл слишком большой!*\n\n` +
           `📊 Предметов в сессии: ${items.length}\n` +
@@ -921,6 +910,7 @@ async function completeSession(ctx: BotContext) {
   } catch (error) {
     console.error('Error completing session:', error);
     await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
+  } finally {
     cleanupSession(ctx);
   }
 }
@@ -941,13 +931,6 @@ async function processPhotoQueue(ctx: BotContext) {
   }
 
   const originalSessionId = ctx.session.sessionId;
-
-  // Проверка режима сессии
-  if (!ctx.session.mode) {
-    console.error(`[Photo Queue] Invalid session mode for user ${telegramId}`);
-    await ctx.reply('❌ Ошибка: режим сессии не определен. Нажмите /start, чтобы начать заново.');
-    return;
-  }
 
   // Кэшируем данные сессии перед циклом для оптимизации
   const sessionData = await storage.getSession(originalSessionId);
@@ -1147,58 +1130,63 @@ bot.on('photo', async (ctx) => {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
 
-  // Проверяем сессию
+  // 1. Проверка активной сессии
   if (!ctx.session?.sessionId) {
     await ctx.reply('❌ Нет активной сессии. Нажмите /start, чтобы начать.');
     return;
   }
+
+  // 2. Проверка режима ожидания Excel
   if (ctx.session.waitingForExcel) {
     await ctx.reply('❌ Сначала отправьте Excel файл, прежде чем добавлять скриншоты.');
     return;
   }
 
-  // Проверка срока жизни сессии и получение лимита скриншотов
-  const sessionData = await storage.getSession(ctx.session.sessionId);
-  if (sessionData?.expiresAt && new Date() > sessionData.expiresAt) {
-    await ctx.reply('⏰ Сессия истекла. Завершаю сессию...');
+  // 3. Получаем актуальные данные сессии из БД
+  const session = await storage.getSession(ctx.session.sessionId);
+  if (!session) {
+    await ctx.reply('❌ Сессия не найдена в базе данных');
+    cleanupSession(ctx);
+    return;
+  }
+
+  // 4. Проверка истечения времени сессии
+  if (session.expiresAt && new Date() > session.expiresAt) {
+    await ctx.reply('⏰ Время сессии истекло. Завершаю...');
     await completeSession(ctx);
     return;
   }
 
-  // Получаем лимит скриншотов из сессии в базе данных  
-  const MAX_SCREENSHOTS = sessionData?.photoLimit || 16;
-  if (MAX_SCREENSHOTS === 0) {
-    console.error(`[Photo] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
-    await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
-    return;
-  }
+  // 5. Проверка лимита скриншотов (используем photoLimit из БД)
+  const currentQueueSize = photoQueue.get(telegramId)?.length || 0;
+  const processedCount = ctx.session.screenshotCount || 0;
+  const totalPhotos = processedCount + currentQueueSize + 1;
 
-  // Проверяем лимит ПЕРЕД добавлением в очередь
-  const currentQueue = photoQueue.get(telegramId) || [];
-  const totalPhotosWillBe = (ctx.session.screenshotCount || 0) + currentQueue.length + 1;
-  
-  if (totalPhotosWillBe > MAX_SCREENSHOTS) {
-    await ctx.reply(`❌ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
+  if (session.photoLimit > 0 && totalPhotos > session.photoLimit) {
+    await ctx.reply(
+      `🚫 Достигнут лимит ${session.photoLimit} скриншотов.\n` +
+      `(Обработано: ${processedCount}, в очереди: ${currentQueueSize})`
+    );
     await completeSession(ctx);
     return;
   }
 
+  // 6. Добавление в очередь
   const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
-
-  // Добавляем фото в очередь
+  
   if (!photoQueue.has(telegramId)) {
     photoQueue.set(telegramId, []);
   }
   photoQueue.get(telegramId)!.push(fileId);
-  await ctx.reply(`👍 Скриншот добавлен в очередь (${photoQueue.get(telegramId)!.length} в ожидании).`);
 
-  // Если обработчик уже работает, ничего не делаем
-  if (processingLock.has(telegramId)) {
-    return;
+  // 7. Уведомление пользователя
+  const queuePosition = photoQueue.get(telegramId)!.length;
+  await ctx.reply(`📸 Скриншот добавлен в очередь (${queuePosition} в ожидании)`);
+
+  // 8. Запуск обработки если не занято
+  if (!processingLock.has(telegramId)) {
+    await processPhotoQueue(ctx);
   }
-
-  // Запускаем обработку
-  processPhotoQueue(ctx);
 });
 
 // Handle documents (Excel files)
