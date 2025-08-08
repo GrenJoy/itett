@@ -508,15 +508,25 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
     status: 'active'
   });
 
+  if (!session || !session.id) {
+    throw new Error('Failed to create session');
+  }
+
+  console.log('Created session:', session);
+
+  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  console.log('Existing session:', existingSession);
+
   ctx.session = {
-  sessionId: session.id,
-  mode: type,
-  screenshotProcessed: false,
-  screenshotCount: 0,
-  waitingForExcel: false,       // <-- исправлено
-  waitingForPriceUpdate: false,
-  waitingForSplitPrice: false
+    sessionId: session.id,
+    mode: type,
+    screenshotProcessed: false,
+    screenshotCount: 0,
+    waitingForExcel: false,
+    waitingForPriceUpdate: false,
+    waitingForSplitPrice: false
   };
+
 
   const keyboard = type === 'multishot' 
     ? Markup.inlineKeyboard([
