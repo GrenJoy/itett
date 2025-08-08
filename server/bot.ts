@@ -514,7 +514,7 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
 
   console.log('Created session:', session);
 
-  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  let existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   console.log('Existing session:', existingSession);
 
   ctx.session = {
