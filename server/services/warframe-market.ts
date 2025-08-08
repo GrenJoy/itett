@@ -1,5 +1,10 @@
+// Файл: market.ts
+// Версия: Финальная, с чтением из файла и функцией-корректором
+
 import { type WarframeMarketItem } from "@shared/schema";
 import pLimit from "p-limit";
+import fs from 'fs';
+import path from 'path';
 
 const WFM_BASE_URL = "https://api.warframe.market/v2";
 const limit = pLimit(2); // Limit to 2 concurrent requests to prevent 429 errors
@@ -32,19 +37,15 @@ export function normalizeString(text: string): string {
     .replace(/\s+/, ' ');
 }
 
+// УЛУЧШЕННАЯ ФУНКЦИЯ ЗАГРУЗКИ КЭША
 export async function loadItemsCache(): Promise<void> {
+  const filePath = path.join(process.cwd(), 'data', 'items.json');
+  
   try {
-    console.log("Loading items cache from Warframe Market...");
-    const response = await fetch(`${WFM_BASE_URL}/items`, {
-      headers: HEADERS,
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    
-    const data = await response.json();
-    const items = data.data || [];
+    // 1. Пытаемся прочитать локальный файл
+    console.log(`Загрузка кэша предметов из локального файла: ${filePath}`);
+    const fileContent = fs.readFileSync(filePath, 'utf-8');
+    const items = JSON.parse(fileContent);
     
     itemsCache.clear();
     for (const item of items) {
@@ -53,11 +54,31 @@ export async function loadItemsCache(): Promise<void> {
         itemsCache.set(normalizeString(itemNameRu), item);
       }
     }
+    console.log(`✅ Кэш успешно загружен из файла: ${itemsCache.size} предметов.`);
     
-    console.log(`Items cache loaded: ${itemsCache.size} items`);
-  } catch (error) {
-    console.error('Failed to load items cache:', error);
-    throw new Error(`Failed to load Warframe Market items: ${error}`);
+  } catch (fileError) {
+    // 2. Если файл не найден или ошибка - идем в интернет как запасной вариант
+    console.warn(`⚠️ Локальный файл не найден или поврежден. Загружаю кэш из API Warframe Market...`);
+    
+    try {
+      const response = await fetch(`${WFM_BASE_URL}/items`, { headers: HEADERS });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      
+      const data = await response.json();
+      const items = data.data || [];
+      
+      itemsCache.clear();
+      for (const item of items) {
+        const itemNameRu = item.i18n?.ru?.name;
+        if (itemNameRu) {
+          itemsCache.set(normalizeString(itemNameRu), item);
+        }
+      }
+      console.log(`✅ Кэш успешно загружен из API: ${itemsCache.size} предметов.`);
+    } catch (apiError) {
+      console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить кэш ни из файла, ни из API.', apiError);
+      throw new Error('Failed to load Warframe Market items cache.');
+    }
   }
 }
 
@@ -70,9 +91,7 @@ export function findItemSlug(itemName: string): string | null {
 export async function getItemPrices(slug: string): Promise<WarframeMarketItem | null> {
   try {
     const url = `${WFM_BASE_URL}/orders/item/${slug}/top`;
-    const response = await fetch(url, {
-      headers: HEADERS,
-    });
+    const response = await fetch(url, { headers: HEADERS });
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -92,7 +111,6 @@ export async function getItemPrices(slug: string): Promise<WarframeMarketItem | 
       ? Math.round((buyPrices.reduce((a, b) => a + b, 0) / buyPrices.length) * 100) / 100
       : 0;
 
-    // Get Russian name from cache
     const cacheItem = Array.from(itemsCache.values()).find(item => item.slug === slug);
     const name = cacheItem?.i18n?.ru?.name || slug;
     
@@ -124,12 +142,11 @@ async function retryWarframeMarketRequest<T>(
         throw error;
       }
       
-      // Check if it's a rate limit error (429) or server error (5xx)
       const statusMatch = error.message?.match(/HTTP (\d+)/);
       const status = statusMatch ? parseInt(statusMatch[1]) : 0;
       
       if (status === 429 || status >= 500) {
-        const delay = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
+        const delay = baseDelay * Math.pow(2, attempt - 1);
         console.warn(`Warframe Market API error ${status}, retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
@@ -145,7 +162,7 @@ export async function processItemForMarket(itemName: string): Promise<WarframeMa
     return retryWarframeMarketRequest(async () => {
       const slug = findItemSlug(itemName);
       if (!slug) {
-        console.log(`Item not found in cache: ${itemName}`);
+        // Убрали console.log отсюда, чтобы не спамить. Логирование будет в getCorrectedItemName.
         return null;
       }
       
@@ -153,6 +170,31 @@ export async function processItemForMarket(itemName: string): Promise<WarframeMa
     });
   });
 }
+
+// НОВАЯ ФУНКЦИЯ-КОРРЕКТОР ("МОЗГ")
+export function getCorrectedItemName(rawName: string): string | null {
+  if (!rawName) return null;
+
+  let processedName = rawName.trim();
+
+  // 1. Применяем жесткие правила для чертежей
+  if (processedName.toLowerCase().startsWith('чертёж:')) {
+    processedName = processedName.substring(7).trim() + " (Чертеж)";
+  }
+  
+  // 2. Проверяем на точное совпадение в кэше
+  const normalizedProcessedName = normalizeString(processedName);
+  if (itemsCache.has(normalizedProcessedName)) {
+    // Возвращаем официальное, красивое название из кэша
+    return itemsCache.get(normalizedProcessedName)!.i18n.ru.name;
+  }
+
+  // 3. Если ничего не нашли, логируем ошибку.
+  // В будущем сюда можно добавить `string-similarity` для исправления опечаток
+  console.warn(`[Corrector] Не удалось найти точное совпадение для: "${rawName}" -> "${processedName}"`);
+  return null;
+}
+
 
 // Initialize cache on module load
 loadItemsCache().catch(console.error);

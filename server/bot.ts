@@ -5,6 +5,7 @@ import { processItemForMarket } from './services/warframe-market';
 import { generateExcelBuffer, parseExcelBuffer } from './services/excel';
 import { consolidateItems, consolidateNewItems } from './services/item-consolidation';
 import { type InsertInventoryItem } from '@shared/schema';
+import { processItemForMarket, getCorrectedItemName } from './services/warframe-market';
 
 interface BotContext extends Context {
   session?: {
@@ -625,22 +626,16 @@ bot.on('photo', async (ctx) => {
     await ctx.reply('❌ Сначала отправьте Excel файл');
     return;
   }
-
-  const sessionId = ctx.session.sessionId;
-  const session = await storage.getSession(sessionId);
   
-  // Restrictions for oneshot mode
   if (ctx.session.mode === 'oneshot' && ctx.session.screenshotProcessed) {
     await ctx.reply('❌ В режиме одноразового анализа можно отправить только один скриншот. Сессия завершена.');
     await completeSession(ctx);
     return;
   }
 
-  // Restrictions for multishot and edit modes - screenshot count only
   const MAX_SCREENSHOTS = 16;
-  if ((ctx.session.mode === 'multishot' || ctx.session.mode === 'edit') && 
-      (ctx.session.screenshotCount || 0) >= MAX_SCREENSHOTS) {
-    await ctx.reply(`❌ Превышен лимит скриншотов (${MAX_SCREENSHOTS}). Принудительно завершаю сессию...`);
+  if ((ctx.session.mode === 'multishot' || ctx.session.mode === 'edit') && (ctx.session.screenshotCount || 0) >= MAX_SCREENSHOTS) {
+    await ctx.reply(`❌ Превышен лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
     await completeSession(ctx);
     return;
   }
@@ -648,26 +643,23 @@ bot.on('photo', async (ctx) => {
   try {
     await ctx.reply('🔄 Анализирую скриншот...');
     
-    // Increment screenshot count
     ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
     
-    // Get largest photo
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     const fileId = photo.file_id;
-    
-    // Get file info and download
     const fileInfo = await ctx.telegram.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
-    
     const response = await fetch(fileUrl);
     const buffer = await response.arrayBuffer();
     const base64Image = Buffer.from(buffer).toString('base64');
 
-    // Analyze with Gemini
-    const extractedItems = await analyzeWarframeScreenshot(base64Image);
+    // ================== НОВАЯ НАДЕЖНАЯ ЛОГИКА ==================
+
+    // 1. Получаем "сырой" список от Gemini
+    const rawExtractedItems = await analyzeWarframeScreenshot(base64Image);
     
-    if (extractedItems.length === 0) {
-      await ctx.reply('❌ На скриншоте не найдено предметов Warframe');
+    if (rawExtractedItems.length === 0) {
+      await ctx.reply('❌ На скриншоте не найдено предметов Warframe.');
       if (ctx.session.mode === 'oneshot') {
         ctx.session.screenshotProcessed = true;
         await completeSession(ctx);
@@ -675,84 +667,83 @@ bot.on('photo', async (ctx) => {
       return;
     }
 
-    await ctx.reply(`🔍 Найдено предметов: ${extractedItems.length}\n⏳ Получаю цены с Warframe Market...`);
+    await ctx.reply(`🔍 Распознано предметов: ${rawExtractedItems.length}\n⏳ Проверяю названия и получаю цены...`);
 
-    // Consolidate duplicate items within the screenshot first
-    const consolidatedScreenshotItems = consolidateNewItems(extractedItems.map(item => ({
-      sessionId: ctx.session!.sessionId!,
-      name: item.name,
-      slug: null,
-      quantity: item.quantity,
-      sellPrices: [],
-      buyPrices: [],
-      avgSell: 0,
-      avgBuy: 0,
-      marketUrl: null,
-      source: 'screenshot' as const
-    })));
-
-    // Enrich with market data
-    const enrichedItems: InsertInventoryItem[] = [];
+    // 2. Исправляем, обогащаем и суммируем предметы
+    const consolidatedItems = new Map<string, InsertInventoryItem>();
     
-    for (const item of consolidatedScreenshotItems) {
-      const marketItem = await processItemForMarket(item.name);
+    for (const rawItem of rawExtractedItems) {
+      const correctedName = getCorrectedItemName(rawItem.name);
       
-      enrichedItems.push({
-        sessionId: ctx.session!.sessionId!,
-        name: item.name,
-        slug: marketItem?.slug || null,
-        quantity: item.quantity,
-        sellPrices: marketItem?.sellPrices || [],
-        buyPrices: marketItem?.buyPrices || [],
-        avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
-        avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
-        marketUrl: marketItem?.marketUrl || null,
-        source: 'screenshot' as const
-      });
+      if (correctedName) {
+        if (consolidatedItems.has(correctedName)) {
+          consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
+        } else {
+          const marketItem = await processItemForMarket(correctedName);
+          const newItem: InsertInventoryItem = {
+            sessionId: ctx.session!.sessionId!,
+            name: correctedName,
+            quantity: rawItem.quantity,
+            slug: marketItem?.slug || null,
+            sellPrices: marketItem?.sellPrices || [],
+            buyPrices: marketItem?.buyPrices || [],
+            avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
+            avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+            marketUrl: marketItem?.marketUrl || null,
+            source: 'screenshot' as const
+          };
+          consolidatedItems.set(correctedName, newItem);
+        }
+      }
     }
+    
+    const newEnrichedItems = Array.from(consolidatedItems.values());
 
-    // Get existing items and consolidate with new ones
-    const existingItems = await storage.getItemsBySessionId(ctx.session.sessionId);
-    const finalItems = consolidateItems(enrichedItems, existingItems);
+    // 3. Объединяем новые предметы с уже существующими в сессии
+    const existingItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
+    const finalItems = consolidateItems(newEnrichedItems, existingItems);
 
-    // Clear existing items and save consolidated ones
-    await storage.deleteItemsBySessionId(ctx.session.sessionId);
+    // ================== КОНЕЦ НОВОЙ ЛОГИКИ ==================
+
+    // 4. Сохраняем итоговый результат в базу
+    await storage.deleteItemsBySessionId(ctx.session.sessionId!);
     await storage.createInventoryItems(finalItems);
 
-    const finalTotalItems = await storage.getItemsBySessionId(ctx.session.sessionId);
+    // 5. Формируем и отправляем ответ пользователю
+    const finalTotalItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
     
     let responseText = `✅ Скриншот обработан!\n`;
-    responseText += `📊 Обработано предметов: ${extractedItems.length}\n`;
-    responseText += `🔄 После объединения дубликатов: ${consolidatedScreenshotItems.length}\n`;
+    responseText += `📊 Распознано на скриншоте: ${rawExtractedItems.length}\n`;
+    responseText += `⚙️ Из них опознано и добавлено: ${newEnrichedItems.length}\n`;
     responseText += `📋 Всего в сессии: ${finalTotalItems.length}\n`;
-    responseText += `📸 Скриншотов: ${ctx.session.screenshotCount}/${ctx.session.mode === 'oneshot' ? '1' : '16'}\n\n`;
+    responseText += `📸 Скриншотов: ${ctx.session.screenshotCount}/${MAX_SCREENSHOTS}\n\n`;
     
-    // Show some processed items
-    const itemsToShow = consolidatedScreenshotItems.slice(0, 5);
-    responseText += '🎯 Обработанные предметы:\n';
-    for (const item of itemsToShow) {
-      responseText += `• ${item.name} (${item.quantity})\n`;
-    }
-    
-    if (consolidatedScreenshotItems.length > 5) {
-      responseText += `... и еще ${consolidatedScreenshotItems.length - 5} предметов\n`;
+    const itemsToShow = newEnrichedItems.slice(0, 5);
+    if (itemsToShow.length > 0) {
+      responseText += '🎯 Добавленные предметы:\n';
+      for (const item of itemsToShow) {
+        responseText += `• ${item.name} (${item.quantity})\n`;
+      }
+      if (newEnrichedItems.length > 5) {
+        responseText += `... и еще ${newEnrichedItems.length - 5} предметов\n`;
+      }
+    } else {
+      responseText += '❌ Ни одного предмета не удалось опознать. Возможно, на скриншоте нет прайм-предметов или они были распознаны неверно.\n'
     }
 
-    // Auto-complete for oneshot mode or when limit reached
+    // 6. Завершаем сессию или предлагаем продолжить
     if (ctx.session.mode === 'oneshot') {
       ctx.session.screenshotProcessed = true;
       await ctx.reply(responseText);
       await completeSession(ctx);
     } else if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
-      await ctx.reply(responseText + '\n⚠️ Достигнут лимит скриншотов. Принудительно завершаю сессию...');
+      await ctx.reply(responseText + '\n⚠️ Достигнут лимит скриншотов. Завершаю сессию...');
       await completeSession(ctx);
     } else {
-      // Show control buttons for multishot/edit mode
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
         [Markup.button.callback('❌ Отменить', 'cancel_session')]
       ]);
-      
       await ctx.reply(responseText + `\n📸 Можете отправить еще ${MAX_SCREENSHOTS - ctx.session.screenshotCount} скриншотов`, keyboard);
     }
 
@@ -760,7 +751,7 @@ bot.on('photo', async (ctx) => {
     console.error('Error processing photo:', error);
     await ctx.reply('❌ Ошибка при обработке скриншота. Попробуйте еще раз или отправьте другой скриншот.');
     
-    if (ctx.session.mode === 'oneshot') {
+    if (ctx.session.mode === 'oneshot' && ctx.session) {
       ctx.session.screenshotProcessed = true;
       await completeSession(ctx);
     }
