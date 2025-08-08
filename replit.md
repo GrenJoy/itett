@@ -62,6 +62,13 @@ This is a Warframe inventory management Telegram bot that analyzes game screensh
   - Added proper database constraints (CHECK constraints) matching SQL schema
   - Configured CASCADE delete behavior for data integrity
   - Enhanced Drizzle schema to match production PostgreSQL constraints exactly
+- **Final Schema Modernization (August 2025):**
+  - Successfully removed oneshot mode completely from database constraints
+  - Fixed API key configuration (GEMINI_API_KEY → GOOGLE_API_KEY) for proper authentication
+  - Verified database constraints properly reject oneshot attempts
+  - All sessions now have photoLimit (16) and expiresAt (1 hour) fields populated
+  - Background cleanup system operational for expired sessions
+  - Production-ready with complete session lifecycle management
 - **Bot Simplification - Oneshot Mode Removal (August 2025):**
   - Removed oneshot mode completely from the Telegram bot
   - All screenshot analysis now uses multishot mode with 16 screenshot limit

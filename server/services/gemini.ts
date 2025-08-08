@@ -1,7 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 import pLimit from "p-limit";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const ai = new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY || "" });
 const geminiLimit = pLimit(3); // Limit to 3 concurrent Gemini requests
 
 export interface ExtractedItem {
