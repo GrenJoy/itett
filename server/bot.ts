@@ -1,11 +1,109 @@
 import { Telegraf, Context, Markup } from 'telegraf';
 import { storage } from './storage';
 import { analyzeWarframeScreenshot } from './services/gemini';
-import { processItemForMarket } from './services/warframe-market';
 import { generateExcelBuffer, parseExcelBuffer } from './services/excel';
 import { consolidateItems, consolidateNewItems } from './services/item-consolidation';
 import { type InsertInventoryItem } from '@shared/schema';
 import { processItemForMarket, getCorrectedItemName } from './services/warframe-market';
+
+
+function parseTextToItems(text: string): { name: string; quantity: number }[] {
+  const lines = text.split('\n').filter(line => line.trim() !== '');
+  
+  return lines.map(line => {
+    const parts = line.split('|');
+    const name = parts[0].trim();
+    const quantity = parts.length > 1 && !isNaN(parseInt(parts[1])) ? parseInt(parts[1].trim()) : 1;
+    return { name, quantity };
+  });
+}
+
+// --- ФУНКЦИЯ 2: Центральная "фабрика" обработки предметов ---
+async function processRawItems(ctx: BotContext, rawItems: { name: string; quantity: number }[]) {
+  if (!ctx.session?.sessionId) {
+    await ctx.reply('Произошла ошибка сессии. Пожалуйста, начните заново /start');
+    return;
+  }
+  
+  if (rawItems.length === 0) {
+    await ctx.reply('Не найдено предметов для обработки.');
+    return;
+  }
+  
+  const loadingMessage = await ctx.reply(`🔍 Найдено предметов: ${rawItems.length}\n⏳ Проверяю названия и получаю цены...`);
+
+  const consolidatedItems = new Map<string, InsertInventoryItem>();
+  const unrecognizedItems: string[] = [];
+  
+  for (const rawItem of rawItems) {
+    const correctedName = getCorrectedItemName(rawItem.name);
+    
+    if (correctedName) {
+      if (consolidatedItems.has(correctedName)) {
+        consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
+      } else {
+        const marketItem = await processItemForMarket(correctedName);
+        const newItem: InsertInventoryItem = {
+          sessionId: ctx.session!.sessionId!,
+          name: correctedName,
+          quantity: rawItem.quantity,
+          slug: marketItem?.slug || null,
+          sellPrices: marketItem?.sellPrices || [],
+          buyPrices: marketItem?.buyPrices || [],
+          avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
+          avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+          marketUrl: marketItem?.marketUrl || null,
+          source: 'screenshot' as const // Можно оставить так, т.к. источник - сессия, а не файл
+        };
+        consolidatedItems.set(correctedName, newItem);
+      }
+    } else {
+      unrecognizedItems.push(rawItem.name);
+    }
+  }
+
+  const newEnrichedItems = Array.from(consolidatedItems.values());
+
+  const existingItems = await storage.getItemsBySessionId(ctx.session.sessionId);
+  const finalItems = consolidateItems(newEnrichedItems, existingItems);
+
+  await storage.deleteItemsBySessionId(ctx.session.sessionId);
+  await storage.createInventoryItems(finalItems);
+  
+  const finalTotalItems = await storage.getItemsBySessionId(ctx.session.sessionId);
+    
+  let responseText = `✅ Данные обработаны!\n`;
+  responseText += `⚙️ Опознано и добавлено: ${newEnrichedItems.length}\n`;
+  if (unrecognizedItems.length > 0) {
+    responseText += `⚠️ Не удалось опознать: ${unrecognizedItems.length}\n`;
+  }
+  responseText += `📋 Всего в сессии: ${finalTotalItems.length}\n\n`;
+
+  if (unrecognizedItems.length > 0) {
+    responseText += `*Неопознанные предметы:*\n`;
+    for (const itemName of unrecognizedItems.slice(0, 5)) {
+      responseText += `• \`${itemName}\`\n`;
+    }
+    if (unrecognizedItems.length > 5) {
+      responseText += `...и еще ${unrecognizedItems.length - 5}.\n`;
+    }
+    responseText += `\n💡 Вы можете скопировать эти названия, исправить их и отправить мне текстом в формате \`Название|Количество\`, чтобы добавить их вручную.\n`;
+  }
+
+  // Удаляем сообщение "Проверяю названия..."
+  await ctx.deleteMessage(loadingMessage.message_id);
+
+  // Ответ пользователю
+  if (ctx.session?.mode !== 'oneshot') {
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+      [Markup.button.callback('❌ Отменить', 'cancel_session')]
+    ]);
+    await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
+  } else {
+    await ctx.reply(responseText, { parse_mode: 'Markdown' });
+  }
+}
 
 interface BotContext extends Context {
   session?: {
@@ -621,18 +719,15 @@ bot.on('photo', async (ctx) => {
     await ctx.reply('❌ Сначала выберите режим работы командой /start');
     return;
   }
-
   if (ctx.session.waitingForExcel) {
     await ctx.reply('❌ Сначала отправьте Excel файл');
     return;
   }
-  
   if (ctx.session.mode === 'oneshot' && ctx.session.screenshotProcessed) {
     await ctx.reply('❌ В режиме одноразового анализа можно отправить только один скриншот. Сессия завершена.');
     await completeSession(ctx);
     return;
   }
-
   const MAX_SCREENSHOTS = 16;
   if ((ctx.session.mode === 'multishot' || ctx.session.mode === 'edit') && (ctx.session.screenshotCount || 0) >= MAX_SCREENSHOTS) {
     await ctx.reply(`❌ Превышен лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
@@ -641,7 +736,7 @@ bot.on('photo', async (ctx) => {
   }
 
   try {
-    await ctx.reply('🔄 Анализирую скриншот...');
+    const loadingMessage = await ctx.reply('🔄 Анализирую скриншот...');
     
     ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
     
@@ -653,12 +748,10 @@ bot.on('photo', async (ctx) => {
     const buffer = await response.arrayBuffer();
     const base64Image = Buffer.from(buffer).toString('base64');
 
-    // ================== НОВАЯ НАДЕЖНАЯ ЛОГИКА ==================
-
-    // 1. Получаем "сырой" список от Gemini
     const rawExtractedItems = await analyzeWarframeScreenshot(base64Image);
     
     if (rawExtractedItems.length === 0) {
+      await ctx.deleteMessage(loadingMessage.message_id);
       await ctx.reply('❌ На скриншоте не найдено предметов Warframe.');
       if (ctx.session.mode === 'oneshot') {
         ctx.session.screenshotProcessed = true;
@@ -667,49 +760,38 @@ bot.on('photo', async (ctx) => {
       return;
     }
 
-    await ctx.reply(`🔍 Распознано предметов: ${rawExtractedItems.length}\n⏳ Проверяю названия и получаю цены...`);
+    await ctx.telegram.editMessageText(ctx.chat!.id, loadingMessage.message_id, undefined, `🔍 Распознано предметов: ${rawExtractedItems.length}\n⏳ Проверяю названия и получаю цены...`);
 
-    // 2. Исправляем, обогащаем и суммируем предметы
     const consolidatedItems = new Map<string, InsertInventoryItem>();
+    const unrecognizedItems: string[] = [];
     
     for (const rawItem of rawExtractedItems) {
       const correctedName = getCorrectedItemName(rawItem.name);
-      
       if (correctedName) {
         if (consolidatedItems.has(correctedName)) {
           consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
         } else {
           const marketItem = await processItemForMarket(correctedName);
           const newItem: InsertInventoryItem = {
-            sessionId: ctx.session!.sessionId!,
-            name: correctedName,
-            quantity: rawItem.quantity,
-            slug: marketItem?.slug || null,
-            sellPrices: marketItem?.sellPrices || [],
-            buyPrices: marketItem?.buyPrices || [],
-            avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
-            avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
-            marketUrl: marketItem?.marketUrl || null,
-            source: 'screenshot' as const
+            sessionId: ctx.session!.sessionId!, name: correctedName, quantity: rawItem.quantity,
+            slug: marketItem?.slug || null, sellPrices: marketItem?.sellPrices || [], buyPrices: marketItem?.buyPrices || [],
+            avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0, avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+            marketUrl: marketItem?.marketUrl || null, source: 'screenshot' as const
           };
           consolidatedItems.set(correctedName, newItem);
         }
+      } else {
+        unrecognizedItems.push(rawItem.name);
       }
     }
     
     const newEnrichedItems = Array.from(consolidatedItems.values());
-
-    // 3. Объединяем новые предметы с уже существующими в сессии
     const existingItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
     const finalItems = consolidateItems(newEnrichedItems, existingItems);
 
-    // ================== КОНЕЦ НОВОЙ ЛОГИКИ ==================
-
-    // 4. Сохраняем итоговый результат в базу
     await storage.deleteItemsBySessionId(ctx.session.sessionId!);
     await storage.createInventoryItems(finalItems);
 
-    // 5. Формируем и отправляем ответ пользователю
     const finalTotalItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
     
     let responseText = `✅ Скриншот обработан!\n`;
@@ -717,6 +799,18 @@ bot.on('photo', async (ctx) => {
     responseText += `⚙️ Из них опознано и добавлено: ${newEnrichedItems.length}\n`;
     responseText += `📋 Всего в сессии: ${finalTotalItems.length}\n`;
     responseText += `📸 Скриншотов: ${ctx.session.screenshotCount}/${MAX_SCREENSHOTS}\n\n`;
+    
+    if (unrecognizedItems.length > 0) {
+      responseText += `⚠️ *Не удалось опознать ${unrecognizedItems.length} предмет(ов):*\n`;
+      for (const itemName of unrecognizedItems.slice(0, 5)) {
+        responseText += `• \`${itemName}\`\n`;
+      }
+      if (unrecognizedItems.length > 5) {
+        responseText += `...и еще ${unrecognizedItems.length - 5}.\n`;
+      }
+      // ↓↓↓ ВАША ГЕНИАЛЬНАЯ ПОДСКАЗКА ↓↓↓
+      responseText += `\n💡 Вы можете скопировать эти названия, исправить их и отправить мне текстом в формате \`Название|Количество\`, чтобы добавить их вручную.\n\n`;
+    }
     
     const itemsToShow = newEnrichedItems.slice(0, 5);
     if (itemsToShow.length > 0) {
@@ -727,30 +821,30 @@ bot.on('photo', async (ctx) => {
       if (newEnrichedItems.length > 5) {
         responseText += `... и еще ${newEnrichedItems.length - 5} предметов\n`;
       }
-    } else {
-      responseText += '❌ Ни одного предмета не удалось опознать. Возможно, на скриншоте нет прайм-предметов или они были распознаны неверно.\n'
+    } else if (unrecognizedItems.length === 0) {
+      responseText += '❌ Ни одного предмета не удалось опознать.\n'
     }
 
-    // 6. Завершаем сессию или предлагаем продолжить
+    await ctx.deleteMessage(loadingMessage.message_id);
+
     if (ctx.session.mode === 'oneshot') {
       ctx.session.screenshotProcessed = true;
-      await ctx.reply(responseText);
+      await ctx.reply(responseText, { parse_mode: 'Markdown' });
       await completeSession(ctx);
     } else if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
-      await ctx.reply(responseText + '\n⚠️ Достигнут лимит скриншотов. Завершаю сессию...');
+      await ctx.reply(responseText + '\n⚠️ Достигнут лимит скриншотов. Завершаю сессию...', { parse_mode: 'Markdown' });
       await completeSession(ctx);
     } else {
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
         [Markup.button.callback('❌ Отменить', 'cancel_session')]
       ]);
-      await ctx.reply(responseText + `\n📸 Можете отправить еще ${MAX_SCREENSHOTS - ctx.session.screenshotCount} скриншотов`, keyboard);
+      await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
     }
 
   } catch (error) {
     console.error('Error processing photo:', error);
-    await ctx.reply('❌ Ошибка при обработке скриншота. Попробуйте еще раз или отправьте другой скриншот.');
-    
+    await ctx.reply('❌ Ошибка при обработке скриншота.');
     if (ctx.session.mode === 'oneshot' && ctx.session) {
       ctx.session.screenshotProcessed = true;
       await completeSession(ctx);
@@ -859,6 +953,8 @@ bot.on('document', async (ctx) => {
     await ctx.reply('❌ Ошибка при обработке Excel файла. Проверьте формат файла.');
   }
 });
+
+
 
 // Handle price update document processing
 async function handlePriceUpdateDocument(ctx: BotContext) {
@@ -1092,30 +1188,108 @@ async function handleExcelSplit(ctx: BotContext) {
 
 // Handle text messages (for split price threshold)
 bot.on('text', async (ctx) => {
+  // Сначала обрабатываем сценарий с порогом цены (старая логика)
   if (ctx.session?.waitingForSplitPrice) {
     const priceText = ctx.message.text.trim();
     const price = parseFloat(priceText);
-    
     if (isNaN(price) || price <= 0) {
-      await ctx.reply('❌ Введите корректное число больше 0. Например: 12 или 15.5');
+      await ctx.reply('❌ Введите корректное число больше 0.');
       return;
     }
-    
     ctx.session.splitThreshold = price;
     ctx.session.waitingForSplitPrice = false;
-    
     await handleExcelSplit(ctx);
     return;
   }
   
-  await ctx.reply('❌ Поддерживаются только изображения и Excel файлы. Используйте /start для выбора режима.');
+  // Проверяем, активна ли сессия и подходит ли режим для добавления текстом
+  if (!ctx.session?.sessionId || (ctx.session.mode !== 'multishot' && ctx.session.mode !== 'edit')) {
+    if (!ctx.message.text.startsWith('/')) {
+      await ctx.reply('💡 Чтобы добавить предметы текстом, начните сессию "Многоразовый анализ" или "Редактирование Excel".');
+    }
+    return;
+  }
+
+  try {
+    const loadingMessage = await ctx.reply('🔄 Обрабатываю ваш текст...');
+
+    const text = ctx.message.text;
+    const lines = text.split('\n').filter(line => line.trim() !== '');
+
+    const itemsFromText: { name: string, quantity: number }[] = lines.map(line => {
+      const parts = line.split('|');
+      const name = parts[0].trim();
+      const quantity = parts.length > 1 && !isNaN(parseInt(parts[1])) ? parseInt(parts[1].trim()) : 1;
+      return { name, quantity };
+    });
+
+    if (itemsFromText.length === 0) {
+      await ctx.deleteMessage(loadingMessage.message_id);
+      await ctx.reply('Не найдено предметов для добавления в вашем сообщении.');
+      return;
+    }
+
+    const consolidatedItems = new Map<string, InsertInventoryItem>();
+    const unrecognizedItems: string[] = [];
+    
+    for (const rawItem of itemsFromText) {
+      const correctedName = getCorrectedItemName(rawItem.name);
+      if (correctedName) {
+        if (consolidatedItems.has(correctedName)) {
+          consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
+        } else {
+          const marketItem = await processItemForMarket(correctedName);
+          const newItem: InsertInventoryItem = {
+            sessionId: ctx.session!.sessionId!, name: correctedName, quantity: rawItem.quantity,
+            slug: marketItem?.slug || null, sellPrices: marketItem?.sellPrices || [], buyPrices: marketItem?.buyPrices || [],
+            avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0, avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+            marketUrl: marketItem?.marketUrl || null, source: 'excel' as const
+          };
+          consolidatedItems.set(correctedName, newItem);
+        }
+      } else {
+        unrecognizedItems.push(rawItem.name);
+      }
+    }
+
+    const newEnrichedItems = Array.from(consolidatedItems.values());
+    const existingItems = await storage.getItemsBySessionId(ctx.session!.sessionId!);
+    const finalItems = consolidateItems(newEnrichedItems, existingItems);
+
+    await storage.deleteItemsBySessionId(ctx.session!.sessionId!);
+    await storage.createInventoryItems(finalItems);
+    
+    const finalTotalItems = await storage.getItemsBySessionId(ctx.session!.sessionId!);
+    
+    let responseText = `✅ Текст обработан!\n`;
+    responseText += `⚙️ Опознано и добавлено: ${newEnrichedItems.length}\n`;
+    if (unrecognizedItems.length > 0) {
+      responseText += `⚠️ Не удалось опознать: ${unrecognizedItems.length}\n`;
+    }
+    responseText += `📋 Всего в сессии: ${finalTotalItems.length}\n\n`;
+
+    if (unrecognizedItems.length > 0) {
+      responseText += `*Неопознанные предметы:*\n`;
+      for (const itemName of unrecognizedItems) {
+        responseText += `• \`${itemName}\`\n`;
+      }
+    }
+    
+    await ctx.deleteMessage(loadingMessage.message_id);
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+      [Markup.button.callback('❌ Отменить', 'cancel_session')]
+    ]);
+    
+    await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
+
+  } catch (error) {
+    console.error('Error processing text input:', error);
+    await ctx.reply('❌ Ошибка при обработке вашего текста.');
+  }
 });
 
-// Handle other messages
-bot.on('message', async (ctx) => {
-  if (ctx.session?.waitingForSplitPrice) return; // Already handled by text handler
-  await ctx.reply('❌ Поддерживаются только изображения и Excel файлы. Используйте /start для выбора режима.');
-});
 
 // Error handling
 bot.catch((err, ctx) => {
