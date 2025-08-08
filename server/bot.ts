@@ -518,15 +518,13 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
   existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   console.log('Existing session:', existingSession);
 
-  ctx.session = {
-    sessionId: session.id,
-    mode: type,
-    screenshotProcessed: false,
-    screenshotCount: 0,
-    waitingForExcel: false,
-    waitingForPriceUpdate: false,
-    waitingForSplitPrice: false
-  };
+  ctx.session.sessionId = session.id;
+  ctx.session.mode = type;
+  ctx.session.screenshotProcessed = false;
+  ctx.session.screenshotCount = 0;
+  ctx.session.waitingForExcel = false;
+  ctx.session.waitingForPriceUpdate = false;
+  ctx.session.waitingForSplitPrice = false;
 
   const keyboard = type === 'multishot' 
     ? Markup.inlineKeyboard([
