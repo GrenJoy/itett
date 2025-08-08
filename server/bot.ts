@@ -42,7 +42,10 @@ async function processRawItems(ctx: BotContext, rawItems: { name: string; quanti
     
     if (correctedName) {
       if (consolidatedItems.has(correctedName)) {
-        consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
+        const existingItem = consolidatedItems.get(correctedName);
+        if (existingItem) {
+          existingItem.quantity += rawItem.quantity;
+        }
       } else {
         const marketItem = await processItemForMarket(correctedName);
         const newItem: InsertInventoryItem = {
@@ -946,9 +949,9 @@ async function processPhotoQueue(ctx: BotContext) {
         break;
       }
 
-      // ПРОВЕРКА №3: Проверка лимита скриншотов
+      // ПРОВЕРКА №3: Проверка лимита скриншотов (должна быть уже обработана при добавлении в очередь)
       if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
-        await ctx.reply(`❌ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
+        console.log(`[Worker] Screenshot limit reached for user ${telegramId}, completing session`);
         photoQueue.delete(telegramId);
         await completeSession(ctx);
         break;
@@ -962,7 +965,9 @@ async function processPhotoQueue(ctx: BotContext) {
         const remainingInQueue = photoQueue.get(telegramId)?.length || 0;
         const loadingMessage = await ctx.reply(`🔄 Анализирую скриншот... (${remainingInQueue} в очереди)`);
 
-        ctx.session!.screenshotCount = (ctx.session?.screenshotCount || 0) + 1;
+        if (ctx.session) {
+          ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
+        }
 
         const fileInfo = await ctx.telegram.getFile(fileId);
         const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
@@ -994,7 +999,10 @@ async function processPhotoQueue(ctx: BotContext) {
           const correctedName = getCorrectedItemName(rawItem.name);
           if (correctedName) {
             if (consolidatedItems.has(correctedName)) {
-              consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
+              const existingItem = consolidatedItems.get(correctedName);
+              if (existingItem) {
+                existingItem.quantity += rawItem.quantity;
+              }
             } else {
               const marketItem = await processItemForMarket(correctedName);
               if (cancellationRequests.has(telegramId)) break;
@@ -1119,7 +1127,11 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+  // Проверяем лимит ПЕРЕД добавлением в очередь
+  const currentQueue = photoQueue.get(telegramId) || [];
+  const totalPhotosWillBe = (ctx.session.screenshotCount || 0) + currentQueue.length + 1;
+  
+  if (totalPhotosWillBe > MAX_SCREENSHOTS) {
     await ctx.reply(`❌ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
     await completeSession(ctx);
     return;
