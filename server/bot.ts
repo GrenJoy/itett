@@ -44,7 +44,7 @@ async function processRawItems(ctx: BotContext, rawItems: { name: string; quanti
       if (consolidatedItems.has(correctedName)) {
         const existingItem = consolidatedItems.get(correctedName);
         if (existingItem) {
-          existingItem.quantity += rawItem.quantity;
+          existingItem.quantity = (existingItem.quantity || 0) + rawItem.quantity;
         }
       } else {
         const marketItem = await processItemForMarket(correctedName);
@@ -150,29 +150,48 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // Проверка, идет ли обработка
-  if (processingLock.has(telegramId)) {
-    await ctx.reply('⏳ Пожалуйста, дождитесь завершения текущей обработки перед началом новой сессии.');
-    return;
-  }
-
-  // Останавливаем текущую обработку
-  if (photoQueue.has(telegramId)) {
-    photoQueue.delete(telegramId);
-  }
-  cancellationRequests.add(telegramId);
-  console.log(`[STOP] Cancellation requested for user ${telegramId} via /start.`);
-
-  // Отменяем существующую сессию
+  // Проверяем существующую активную сессию
   const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
-    await storage.updateSessionStatus(existingSession.id, 'cancelled');
-    console.log(`[DB] Cancelled session ${existingSession.id} for user ${telegramId}`);
+    // Останавливаем текущую обработку
+    if (photoQueue.has(telegramId)) {
+      photoQueue.delete(telegramId);
+    }
+    cancellationRequests.add(telegramId);
+    console.log(`[STOP] Force completing session ${existingSession.id} for user ${telegramId} via /start.`);
+    
+    // Проверяем есть ли обработанные данные в сессии
+    const existingItems = await storage.getItemsBySessionId(existingSession.id);
+    if (existingItems.length > 0) {
+      await ctx.reply('⏳ Завершаю текущую сессию и формирую Excel из обработанных данных...');
+      
+      try {
+        // Генерируем Excel и отправляем пользователю
+        const excelBuffer = await generateExcelBuffer(existingItems);
+        
+        // Завершаем сессию
+        await storage.updateSessionStatus(existingSession.id, 'completed');
+        
+        // Отправляем файл
+        await ctx.replyWithDocument(
+          { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
+          { caption: `📊 Ваш частично обработанный инвентарь\n📊 Предметов: ${existingItems.length}\n\n🆕 Теперь можете создать новую сессию.` }
+        );
+      } catch (error) {
+        console.error('Error generating Excel for forced completion:', error);
+        await ctx.reply('❌ Ошибка при формировании Excel файла. Сессия будет завершена без экспорта.');
+        await storage.updateSessionStatus(existingSession.id, 'cancelled');
+      }
+    } else {
+      // Нет данных - просто отменяем сессию
+      await storage.updateSessionStatus(existingSession.id, 'cancelled');
+      console.log(`[DB] Cancelled empty session ${existingSession.id} for user ${telegramId}`);
+    }
+    
+    // Сбрасываем локальную сессию
+    ctx.session = {};
+    cancellationRequests.delete(telegramId);
   }
-
-  // Сбрасываем локальную сессию
-  ctx.session = {};
-  cancellationRequests.delete(telegramId); // Очистка флага после сброса
 
   // Создаем или получаем пользователя
   let user = await storage.getUserByTelegramId(telegramId);
@@ -950,7 +969,7 @@ async function processPhotoQueue(ctx: BotContext) {
       }
 
       // ПРОВЕРКА №3: Проверка лимита скриншотов (должна быть уже обработана при добавлении в очередь)
-      if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+      if ((ctx.session?.screenshotCount || 0) >= MAX_SCREENSHOTS) {
         console.log(`[Worker] Screenshot limit reached for user ${telegramId}, completing session`);
         photoQueue.delete(telegramId);
         await completeSession(ctx);
@@ -1001,7 +1020,7 @@ async function processPhotoQueue(ctx: BotContext) {
             if (consolidatedItems.has(correctedName)) {
               const existingItem = consolidatedItems.get(correctedName);
               if (existingItem) {
-                existingItem.quantity += rawItem.quantity;
+                existingItem.quantity = (existingItem.quantity || 0) + rawItem.quantity;
               }
             } else {
               const marketItem = await processItemForMarket(correctedName);
@@ -1074,7 +1093,7 @@ async function processPhotoQueue(ctx: BotContext) {
 
         await ctx.deleteMessage(loadingMessage.message_id);
 
-        if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+        if ((ctx.session?.screenshotCount || 0) >= MAX_SCREENSHOTS) {
           await ctx.reply(responseText + `\n⚠️ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`, { parse_mode: 'Markdown' });
           await completeSession(ctx);
         } else {

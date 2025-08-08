@@ -69,6 +69,13 @@ This is a Warframe inventory management Telegram bot that analyzes game screensh
   - All sessions now have photoLimit (16) and expiresAt (1 hour) fields populated
   - Background cleanup system operational for expired sessions
   - Production-ready with complete session lifecycle management
+- **Enhanced /start Command Logic (August 2025):**
+  - Fixed screenshot queue overflow issue (users could exceed 16 limit)
+  - Added pre-queue limit validation to prevent adding screenshots beyond limit
+  - Enhanced /start command to force-complete active sessions with Excel generation
+  - When /start is pressed mid-session, bot exports processed data and clears queue
+  - Proper session isolation: old data exported, queue cleared, new session clean
+  - Formula: (processed + queue + new) ≤ 16 screenshots enforced strictly
 - **Bot Simplification - Oneshot Mode Removal (August 2025):**
   - Removed oneshot mode completely from the Telegram bot
   - All screenshot analysis now uses multishot mode with 16 screenshot limit
