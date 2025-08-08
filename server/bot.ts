@@ -490,8 +490,8 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
 
-  // Cancel any existing active session
-  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  // ✅ Объявляем один раз с let
+  let existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
     await storage.updateSessionStatus(existingSession.id, 'cancelled');
   }
@@ -514,7 +514,8 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
 
   console.log('Created session:', session);
 
-  let existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  // ✅ Переиспользуем переменную, не объявляя заново
+  existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   console.log('Existing session:', existingSession);
 
   ctx.session = {
@@ -526,7 +527,6 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
     waitingForPriceUpdate: false,
     waitingForSplitPrice: false
   };
-
 
   const keyboard = type === 'multishot' 
     ? Markup.inlineKeyboard([
