@@ -111,7 +111,7 @@ app.get('/', (req, res) => {
 // Start the server and bot
 async function startServer() {
   // Render предоставляет переменную PORT. Для локального теста можно задать значение по умолчанию.
-  const port = process.env.PORT || 3000;
+  const port = parseInt(process.env.PORT || '3000', 10);
 
   try {
     // 1. Сначала запускаем веб-сервер, чтобы он открыл порт.
