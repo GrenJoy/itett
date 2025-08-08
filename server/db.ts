@@ -1,4 +1,5 @@
-import { Pool } from 'pg'; // ← теперь используем стандартный pg
+import pkg from 'pg';
+const { Pool } = pkg;
 import { drizzle } from 'drizzle-orm/node-postgres'; // ← используем node-postgres адаптер
 import * as schema from '@shared/schema';
 
