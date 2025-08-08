@@ -637,7 +637,7 @@ async function startSplitExcelSession(ctx: BotContext) {
   );
 }
 
-typescriptasync function completeSession(ctx: BotContext) {
+async function completeSession(ctx: BotContext) {
   if (ctx.callbackQuery) { await ctx.answerCbQuery(); }
   if (!ctx.session?.sessionId) {
     await ctx.reply('Нет активной сессии для завершения.');
