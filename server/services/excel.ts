@@ -117,3 +117,27 @@ export async function parseExcelBuffer(buffer: Buffer): Promise<ExcelItem[]> {
 
   return items;
 }
+export function generateTextContent(items: InventoryItem[]): string {
+  let content = "Инвентарь Warframe\n";
+  content += `Всего уникальных предметов: ${items.length}\n`;
+  content += "========================================\n\n";
+
+  let totalPlatina = 0;
+
+  items.forEach(item => {
+    const avgSellPrice = item.avgSell ? (item.avgSell / 100).toFixed(1) : '0';
+    const itemValue = item.avgSell ? (item.avgSell / 100) * item.quantity : 0;
+    totalPlatina += itemValue;
+
+    content += `${item.name}\n`;
+    content += `  Количество: ${item.quantity} шт.\n`;
+    content += `  Средняя цена продажи: ${avgSellPrice} пл.\n`;
+    content += `  Общая стоимость: ${itemValue.toFixed(1)} пл.\n`;
+    content += `  Ссылка: ${item.marketUrl || 'Нет данных'}\n\n`;
+  });
+
+  content += "========================================\n";
+  content += `ИТОГОВАЯ СТОИМОСТЬ ВСЕХ ПРЕДМЕТОВ: ${totalPlatina.toFixed(1)} пл.\n`;
+
+  return content;
+}

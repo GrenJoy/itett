@@ -5,7 +5,7 @@ import { generateExcelBuffer, parseExcelBuffer } from './services/excel';
 import { consolidateItems, consolidateNewItems } from './services/item-consolidation';
 import { type InsertInventoryItem } from '@shared/schema';
 import { processItemForMarket, getCorrectedItemName } from './services/warframe-market';
-
+import { generateExcelBuffer, parseExcelBuffer, generateTextContent } from './services/excel';
 
 function parseTextToItems(text: string): { name: string; quantity: number }[] {
   const lines = text.split('\n').filter(line => line.trim() !== '');
@@ -384,6 +384,44 @@ bot.command('status', async (ctx) => {
   }
 });
 
+bot.action('download_txt', async (ctx) => {
+  // @ts-ignore
+  const lastExport = ctx.session?.lastExport;
+  if (!lastExport?.text) {
+    await ctx.answerCbQuery('Данные для экспорта устарели. Начните новую сессию.', { show_alert: true });
+    return;
+  }
+  
+  await ctx.answerCbQuery();
+  
+  const textBuffer = Buffer.from(lastExport.text, 'utf-8');
+  await ctx.replyWithDocument(
+    { source: textBuffer, filename: `inventory_${Date.now()}.txt` },
+    { caption: `📋 Ваш инвентарь в .txt\n📊 Предметов: ${lastExport.itemsCount}` }
+  );
+  // Очищаем сессию после скачивания
+  ctx.session = {}; 
+});
+
+bot.action('download_xlsx', async (ctx) => {
+  // @ts-ignore
+  const lastExport = ctx.session?.lastExport;
+  if (!lastExport?.excel) {
+    await ctx.answerCbQuery('Данные для экспорта устарели. Начните новую сессию.', { show_alert: true });
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  
+  const excelBuffer = Buffer.from(lastExport.excel, 'base64');
+  await ctx.replyWithDocument(
+    { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
+    { caption: `📊 Ваш инвентарь в .xlsx\n📊 Предметов: ${lastExport.itemsCount}` }
+  );
+  // Очищаем сессию после скачивания
+  ctx.session = {};
+});
+
 bot.action('back_to_menu', async (ctx) => {
   await ctx.answerCbQuery();
   
@@ -498,7 +536,7 @@ async function startEditSession(ctx: BotContext) {
 
   await ctx.editMessageText(
     '📝 Режим редактирования Excel\n\n' +
-    '📄 Сначала отправьте Excel файл (.xlsx или .xls) с существующими данными\n' +
+    '📄 Сначала отправьте Excel файл (.xlsx), который вы ранее выгрузили из бота. Файлы .txt для этого режима не подходят.\n' +
     'После этого вы сможете добавить новые скриншоты\n' +
     '⚠️ Максимум 16 скриншотов за сессию',
     { parse_mode: 'Markdown', ...keyboard }
@@ -589,8 +627,14 @@ async function startSplitExcelSession(ctx: BotContext) {
 }
 
 async function completeSession(ctx: BotContext) {
+  // Acknowledge callback query if present
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery();
+  }
+
+  // Check for active session
   if (!ctx.session?.sessionId) {
-    await ctx.answerCbQuery('Нет активной сессии');
+    await ctx.reply('Нет активной сессии для завершения.');
     return;
   }
 
@@ -598,28 +642,30 @@ async function completeSession(ctx: BotContext) {
   const session = await storage.getSession(sessionId);
   const items = await storage.getItemsBySessionId(sessionId);
 
+  // Handle empty session
   if (items.length === 0) {
-    await ctx.editMessageText('❌ В сессии нет предметов для экспорта');
+    await ctx.reply('❌ В сессии нет предметов для экспорта. Сессия завершена.');
+    await storage.updateSessionStatus(sessionId, 'completed');
+    ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false, waitingForSplitPrice: false };
     return;
   }
 
   try {
-    // Generate Excel file
-    const buffer = await generateExcelBuffer(items);
-    
+    // Generate Excel and text content
+    const excelBuffer = await generateExcelBuffer(items);
+    const textContent = generateTextContent(items);
+
     // Check file size (2MB limit)
     const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB in bytes
-    if (buffer.byteLength > MAX_FILE_SIZE) {
-      const fileSizeMB = (buffer.byteLength / (1024 * 1024)).toFixed(2);
-      
-      // Update session status and clear session data
+    if (excelBuffer.byteLength > MAX_FILE_SIZE) {
+      const fileSizeMB = (excelBuffer.byteLength / (1024 * 1024)).toFixed(2);
       await storage.updateSessionStatus(sessionId, 'completed');
       ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false, waitingForSplitPrice: false };
-      
+
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
       ]);
-      
+
       await ctx.reply(
         `⚠️ *Файл слишком большой!*\n\n` +
         `📊 Предметов в сессии: ${items.length}\n` +
@@ -634,57 +680,46 @@ async function completeSession(ctx: BotContext) {
       );
       return;
     }
-    
+
+    // Store export data in session
+    // @ts-ignore
+    ctx.session.lastExport = {
+      excel: excelBuffer.toString('base64'),
+      text: textContent,
+      itemsCount: items.length
+    };
+
     // Update session status and clear session data
     await storage.updateSessionStatus(sessionId, 'completed');
-    ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false, waitingForSplitPrice: false };
+    ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false, waitingForSplitPrice: false, lastExport: ctx.session.lastExport };
 
-    // Different messages for different session types
+    // Prepare keyboard for file download options
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('📄 Скачать .txt', 'download_txt')],
+      [Markup.button.callback('📊 Скачать .xlsx', 'download_xlsx')],
+      [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
+    ]);
+
+    // Customize message based on session type
+    let messageText = `✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}\n\nВыберите формат для скачивания:`;
+    let replyOptions = { reply_markup: keyboard };
+
     if (session?.type === 'price_update') {
-      const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
-      ]);
-
-      await ctx.reply(
-        `✅ Цены обновлены!\n` +
-        `📊 Обработано предметов: ${items.length}\n` +
-        `💰 Получены свежие цены с Warframe Market\n\n` +
-        `📎 Ваш обновленный Excel файл:`,
-        keyboard
-      );
-      
-      await ctx.replyWithDocument(
-        { source: buffer, filename: `warframe_updated_prices_${Date.now()}.xlsx` },
-        { caption: `💰 Обновленные цены Warframe\n📊 Предметов: ${items.length}\n\n🔄 Для повторного обновления используйте /start` }
-      );
+      messageText = `✅ Цены обновлены!\n📊 Обработано предметов: ${items.length}\n💰 Получены свежие цены с Warframe Market\n\n📎 Выберите формат для скачивания:`;
     } else if (session?.type === 'split_excel') {
-      const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('🆕 Создать новую сессию', 'create_session')]
-      ]);
+      messageText = `✅ Excel файл разделен!\n📊 Обработано предметов: ${items.length}\n📈 Файлы разделены по ценовому порогу\n\n📎 Выберите формат для скачивания:`;
+    }
 
-      await ctx.reply(
-        `✅ Excel файл разделен!\n` +
-        `📊 Обработано предметов: ${items.length}\n` +
-        `📈 Файлы разделены по ценовому порогу\n\n` +
-        `📎 Ваши разделенные Excel файлы отправлены выше`,
-        keyboard
-      );
+    // Send or edit message based on context
+    if (ctx.callbackQuery) {
+      await ctx.editMessageText(messageText, replyOptions);
     } else {
-      // Regular session completion (oneshot, multishot, edit)
-      await ctx.reply(
-        `✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}`,
-        { reply_markup: { inline_keyboard: [[{ text: '🆕 Создать новую сессию', callback_data: 'create_session' }]] } }
-      );
-      
-      await ctx.replyWithDocument(
-        { source: buffer, filename: `warframe_inventory_${Date.now()}.xlsx` },
-        { caption: `📋 Ваш инвентарь Warframe\n📊 Предметов: ${items.length}\n\n🆕 Для новой сессии нажмите /start` }
-      );
+      await ctx.reply(messageText, replyOptions);
     }
 
   } catch (error) {
     console.error('Error completing session:', error);
-    await ctx.reply('❌ Ошибка при создании Excel файла');
+    await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
   }
 }
 
