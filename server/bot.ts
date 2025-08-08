@@ -508,10 +508,15 @@ async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
     status: 'active'
   });
 
-  ctx.session!.sessionId = session.id;
-  ctx.session!.mode = type;
-  ctx.session!.screenshotProcessed = false;
-  ctx.session!.screenshotCount = 0;
+  ctx.session = {
+  sessionId: session.id,
+  mode: type,
+  screenshotProcessed: false,
+  screenshotCount: 0,
+  waitingForExcel: false,       // <-- исправлено
+  waitingForPriceUpdate: false,
+  waitingForSplitPrice: false
+  };
 
   const keyboard = type === 'multishot' 
     ? Markup.inlineKeyboard([
