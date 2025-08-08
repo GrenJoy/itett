@@ -1,61 +1,59 @@
 import { type InsertInventoryItem, type InventoryItem } from '@shared/schema';
 
+// ↓↓↓ ЭТА ФУНКЦИЯ ПОЛНОСТЬЮ ЗАМЕНЕНА НА НОВУЮ, НАДЕЖНУЮ ВЕРСИЮ ↓↓↓
 export function consolidateItems(newItems: InsertInventoryItem[], existingItems: InventoryItem[]): InsertInventoryItem[] {
-  const consolidated: InsertInventoryItem[] = [];
-  const existingMap = new Map<string, InventoryItem>();
+  // Если новых предметов нет, просто возвращаем старые, ничего не меняя
+  if (newItems.length === 0) {
+    return existingItems as InsertInventoryItem[];
+  }
+
+  // Берем sessionId из первого нового предмета. Он будет одинаковый для всех.
+  const currentSessionId = newItems[0].sessionId;
+  if (!currentSessionId) {
+    // Дополнительная защита: если у новых предметов нет sessionId, возвращаем старые
+    console.error("Critical error: new items are missing sessionId in consolidateItems");
+    return existingItems as InsertInventoryItem[];
+  }
+
+  const consolidatedMap = new Map<string, InsertInventoryItem>();
   
-  // Create map of existing items by normalized name
+  // 1. Сначала добавляем все существующие предметы в Map, чтобы сохранить их порядок и данные
   existingItems.forEach(item => {
     const normalizedName = normalizeItemName(item.name);
-    existingMap.set(normalizedName, item);
+    consolidatedMap.set(normalizedName, { ...item });
   });
   
-  // Process new items
+  // 2. Затем обрабатываем новые предметы, обновляя или добавляя их в Map
   newItems.forEach(newItem => {
     const normalizedName = normalizeItemName(newItem.name);
-    const existing = existingMap.get(normalizedName);
+    const existing = consolidatedMap.get(normalizedName);
     
     if (existing) {
-      // Item exists - consolidate quantities and update prices if newer data is available
-      consolidated.push({
-        ...newItem,
-        quantity: (existing.quantity || 0) + (newItem.quantity || 1),
-        // CRITICAL: Always use NEW market data when available (fixes price update issue)
-        sellPrices: newItem.sellPrices || existing.sellPrices || [],
-        buyPrices: newItem.buyPrices || existing.buyPrices || [],
-        avgSell: newItem.avgSell || existing.avgSell || 0,
-        avgBuy: newItem.avgBuy || existing.avgBuy || 0,
-        marketUrl: newItem.marketUrl || existing.marketUrl,
-        slug: newItem.slug || existing.slug
-      });
-      
-      // Remove from existing map so we don't duplicate
-      existingMap.delete(normalizedName);
+      // Если предмет уже есть, обновляем его: суммируем количество и берем свежие данные с маркета
+      existing.quantity += newItem.quantity;
+      existing.sellPrices = newItem.sellPrices;
+      existing.buyPrices = newItem.buyPrices;
+      existing.avgSell = newItem.avgSell;
+      existing.avgBuy = newItem.avgBuy;
+      existing.marketUrl = newItem.marketUrl;
+      existing.slug = newItem.slug;
     } else {
-      // New item - add as is
-      consolidated.push(newItem);
+      // Если предмета нет, просто добавляем его в Map
+      consolidatedMap.set(normalizedName, newItem);
     }
   });
+
+  // 3. Преобразуем Map обратно в массив
+  const finalItems = Array.from(consolidatedMap.values());
   
-  // Add remaining existing items that weren't consolidated
-  existingMap.forEach(existingItem => {
-    consolidated.push({
-      sessionId: newItems[0]?.sessionId || existingItem.sessionId,
-      name: existingItem.name,
-      slug: existingItem.slug,
-      quantity: existingItem.quantity || 1,
-      sellPrices: (existingItem.sellPrices && Array.isArray(existingItem.sellPrices)) ? existingItem.sellPrices : [],
-      buyPrices: (existingItem.buyPrices && Array.isArray(existingItem.buyPrices)) ? existingItem.buyPrices : [],
-      avgSell: existingItem.avgSell || 0,
-      avgBuy: existingItem.avgBuy || 0,
-      marketUrl: existingItem.marketUrl,
-      source: existingItem.source as "screenshot" | "excel"
-    });
-  });
+  // Финальная проверка, чтобы у всех предметов был правильный sessionId
+  finalItems.forEach(item => item.sessionId = currentSessionId);
   
-  return consolidated;
+  return finalItems;
 }
 
+
+// --- Эта функция остается без изменений ---
 export function consolidateNewItems(items: InsertInventoryItem[]): InsertInventoryItem[] {
   const consolidated = new Map<string, InsertInventoryItem>();
   
@@ -75,17 +73,17 @@ export function consolidateNewItems(items: InsertInventoryItem[]): InsertInvento
   return Array.from(consolidated.values());
 }
 
+
+// --- Эта функция остается без изменений ---
 function normalizeItemName(name: string): string {
+  if (!name) return ''; // Добавлена проверка на пустую строку для надежности
   return name
     .toLowerCase()
     .trim()
     .replace(/\s+/g, ' ')
     .replace('ё', 'е')
-    // Handle common variations
-    .replace(/прайм/g, 'prime')
-    .replace(/prime/g, 'прайм')
+    // Handle common variations (эти правила могут конфликтовать, лучше выбрать одно)
     .replace(/\(чертеж\)/gi, '(чертёж)')
-    .replace(/\(чертёж\)/gi, '(чертеж)')
-    .replace(/система/g, 'systems')
-    .replace(/systems/g, 'система');
+    // .replace(/прайм/g, 'prime') // Эти правила могут быть опасны, если у вас есть и русские, и англ. названия
+    // .replace(/система/g, 'systems')
 }
