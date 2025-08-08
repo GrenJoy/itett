@@ -164,29 +164,20 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // Принудительная остановка текущей обработки
   if (photoQueue.has(telegramId)) {
     cancellationRequests.add(telegramId);
     photoQueue.delete(telegramId);
     console.log(`[STOP] Forced stop of photo queue for user ${telegramId} via /start.`);
   }
 
-  // Проверяем существующую активную сессию
   const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
-    // Проверяем есть ли обработанные данные в сессии
     const existingItems = await storage.getItemsBySessionId(existingSession.id);
     if (existingItems.length > 0) {
       await ctx.reply('⏳ Завершаю текущую сессию и формирую Excel из обработанных данных...');
-      
       try {
-        // Генерируем Excel и отправляем пользователю
         const excelBuffer = await generateExcelBuffer(existingItems);
-        
-        // Завершаем сессию
         await storage.updateSessionStatus(existingSession.id, 'completed');
-        
-        // Отправляем файл
         await ctx.replyWithDocument(
           { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
           { caption: `📊 Ваш частично обработанный инвентарь\n📊 Предметов: ${existingItems.length}\n\n🆕 Теперь можете создать новую сессию.` }
@@ -197,16 +188,12 @@ bot.start(async (ctx) => {
         await storage.updateSessionStatus(existingSession.id, 'cancelled');
       }
     } else {
-      // Нет данных - просто отменяем сессию
       await storage.updateSessionStatus(existingSession.id, 'cancelled');
       console.log(`[DB] Cancelled empty session ${existingSession.id} for user ${telegramId}`);
     }
-    
-    // Сбрасываем локальную сессию
     cleanupSession(ctx);
   }
 
-  // Создаем или получаем пользователя
   let user = await storage.getUserByTelegramId(telegramId);
   if (!user) {
     user = await storage.createUser({
@@ -216,27 +203,6 @@ bot.start(async (ctx) => {
       lastName: ctx.from?.last_name,
     });
   }
-
-  const mainKeyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🆕 Создать новую сессию', 'create_session')],
-    [Markup.button.callback('❓ Помощь', 'help')]
-  ]);
-
-  await ctx.reply(
-    '🎮 *Warframe Inventory Analyzer*\n\n' +
-    'Добро пожаловать в бота для анализа инвентаря Warframe!\n\n' +
-    '🔍 *Возможности:*\n' +
-    '• Анализ скриншотов инвентаря\n' +
-    '• Получение актуальных цен с Warframe Market\n' +
-    '• Экспорт данных в Excel файлы\n' +
-    '• Объединение дубликатов предметов\n' +
-    '• 💰 Обновление цен в старых Excel файлах\n' +
-    '• 📊 Разделение Excel по ценовым порогам\n' +
-    '• Создал: GrendematriX. Для связи discord:grenjoy\n\n' +
-    '*Выберите действие:*',
-    { parse_mode: 'Markdown', ...mainKeyboard }
-  );
-});
 
   const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🆕 Создать новую сессию', 'create_session')],
