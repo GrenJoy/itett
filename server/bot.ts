@@ -152,24 +152,31 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // Немедленно останавливаем любую текущую обработку для этого пользователя
+  // Проверка, идет ли обработка
+  if (processingLock.has(telegramId)) {
+    await ctx.reply('⏳ Пожалуйста, дождитесь завершения текущей обработки перед началом новой сессии.');
+    return;
+  }
+
+  // Останавливаем текущую обработку
   if (photoQueue.has(telegramId)) {
     photoQueue.delete(telegramId);
   }
   cancellationRequests.add(telegramId);
   console.log(`[STOP] Cancellation requested for user ${telegramId} via /start.`);
 
-  // Cancel any existing session in the database
+  // Отменяем существующую сессию
   const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
     await storage.updateSessionStatus(existingSession.id, 'cancelled');
     console.log(`[DB] Cancelled session ${existingSession.id} for user ${telegramId}`);
   }
 
-  // Reset local session context
+  // Сбрасываем локальную сессию
   ctx.session = {};
+  cancellationRequests.delete(telegramId); // Очистка флага после сброса
 
-  // Create or get user
+  // Создаем или получаем пользователя
   let user = await storage.getUserByTelegramId(telegramId);
   if (!user) {
     user = await storage.createUser({
@@ -932,9 +939,27 @@ async function completeSession(ctx: BotContext) {
 // Handle photos
 async function processPhotoQueue(ctx: BotContext) {
   const telegramId = ctx.from?.id.toString();
-  const originalSessionId = ctx.session?.sessionId; // Запоминаем ID сессии на момент запуска
+  const originalSessionId = ctx.session?.sessionId;
 
-  if (!telegramId || !originalSessionId) return;
+  if (!telegramId || !originalSessionId) {
+    await ctx.reply('❌ Ошибка: сессия или пользователь не найдены.');
+    return;
+  }
+
+  // Проверка режима сессии
+  if (!ctx.session?.mode) {
+    console.error(`[Worker] Invalid session mode for user ${telegramId}`);
+    await ctx.reply('❌ Ошибка: режим сессии не определен. Нажмите /start, чтобы начать заново.');
+    return;
+  }
+
+  // Определяем лимит скриншотов
+  const MAX_SCREENSHOTS = ctx.session.mode === 'oneshot' ? 1 : ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  if (MAX_SCREENSHOTS === 0) {
+    console.error(`[Worker] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
+    await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
+    return;
+  }
 
   // Устанавливаем блокировку
   processingLock.add(telegramId);
@@ -943,11 +968,10 @@ async function processPhotoQueue(ctx: BotContext) {
     while (photoQueue.has(telegramId) && photoQueue.get(telegramId)!.length > 0) {
       // ПРОВЕРКА №1: Немедленная остановка по флагу
       if (cancellationRequests.has(telegramId)) {
-        cancellationRequests.delete(telegramId); // Сбрасываем флаг
-        photoQueue.delete(telegramId); // Очищаем остатки очереди
+        cancellationRequests.delete(telegramId);
+        photoQueue.delete(telegramId);
         console.log(`[Worker] Processing stopped for ${telegramId} due to cancellation request.`);
-        // Не отправляем сообщение здесь, т.к. пользователь уже получил ответ от /start или кнопки отмены
-        break; // Немедленно выходим из цикла
+        break;
       }
 
       // ПРОВЕРКА №2: Отложенная проверка статуса сессии в БД
@@ -957,16 +981,25 @@ async function processPhotoQueue(ctx: BotContext) {
         photoQueue.delete(telegramId);
         break;
       }
-      
-      const fileId = photoQueue.get(telegramId)!.shift()!; 
-      
+
+      // ПРОВЕРКА №3: Проверка лимита скриншотов
+      if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+        await ctx.reply(`❌ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
+        photoQueue.delete(telegramId);
+        await completeSession(ctx);
+        break;
+      }
+
+      const fileId = photoQueue.get(telegramId)!.shift()!;
+
       // Внутренний try...catch для обработки ОДНОГО фото
       try {
+        console.log(`[Worker] Processing photo for user ${telegramId}, mode: ${ctx.session.mode}, screenshotCount: ${ctx.session.screenshotCount + 1}/${MAX_SCREENSHOTS}`);
         const remainingInQueue = photoQueue.get(telegramId)?.length || 0;
         const loadingMessage = await ctx.reply(`🔄 Анализирую скриншот... (${remainingInQueue} в очереди)`);
-        
+
         ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
-        
+
         const fileInfo = await ctx.telegram.getFile(fileId);
         const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
         const response = await fetch(fileUrl);
@@ -974,10 +1007,10 @@ async function processPhotoQueue(ctx: BotContext) {
         const base64Image = Buffer.from(buffer).toString('base64');
         const rawExtractedItems = await analyzeWarframeScreenshot(base64Image);
 
-        // Еще одна проверка на отмену СРАЗУ ПОСЛЕ долгой операции
+        // Проверка на отмену после долгой операции
         if (cancellationRequests.has(telegramId)) {
-            await ctx.deleteMessage(loadingMessage.message_id);
-            continue; // Просто переходим к началу цикла, где сработает break
+          await ctx.deleteMessage(loadingMessage.message_id);
+          continue;
         }
 
         if (rawExtractedItems.length === 0) {
@@ -990,38 +1023,42 @@ async function processPhotoQueue(ctx: BotContext) {
 
         const consolidatedItems = new Map<string, InsertInventoryItem>();
         const unrecognizedItems: string[] = [];
-        
+
         for (const rawItem of rawExtractedItems) {
-            // Проверка перед каждой тяжелой операцией
-            if (cancellationRequests.has(telegramId)) break;
+          if (cancellationRequests.has(telegramId)) break;
 
-            const correctedName = getCorrectedItemName(rawItem.name);
-            if (correctedName) {
-                if (consolidatedItems.has(correctedName)) {
-                    consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
-                } else {
-                    const marketItem = await processItemForMarket(correctedName);
-                    // Проверка после тяжелой операции
-                    if (cancellationRequests.has(telegramId)) break;
-
-                    const newItem: InsertInventoryItem = {
-                        sessionId: originalSessionId, // Используем ID старой сессии
-                        name: correctedName, quantity: rawItem.quantity,
-                        slug: marketItem?.slug || null, sellPrices: marketItem?.sellPrices || [], buyPrices: marketItem?.buyPrices || [],
-                        avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0, avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
-                        marketUrl: marketItem?.marketUrl || null, source: 'screenshot' as const
-                    };
-                    consolidatedItems.set(correctedName, newItem);
-                }
+          const correctedName = getCorrectedItemName(rawItem.name);
+          if (correctedName) {
+            if (consolidatedItems.has(correctedName)) {
+              consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
             } else {
-                unrecognizedItems.push(rawItem.name);
+              const marketItem = await processItemForMarket(correctedName);
+              if (cancellationRequests.has(telegramId)) break;
+
+              const newItem: InsertInventoryItem = {
+                sessionId: originalSessionId,
+                name: correctedName,
+                quantity: rawItem.quantity,
+                slug: marketItem?.slug || null,
+                sellPrices: marketItem?.sellPrices || [],
+                buyPrices: marketItem?.buyPrices || [],
+                avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0,
+                avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
+                marketUrl: marketItem?.marketUrl || null,
+                source: 'screenshot' as const
+              };
+              consolidatedItems.set(correctedName, newItem);
             }
+          } else {
+            unrecognizedItems.push(rawItem.name);
+            console.log(`[Corrector] Не удалось найти точное совпадение для: "${rawItem.name}"`);
+          }
         }
-        
+
         // Финальная проверка перед записью в БД
         if (cancellationRequests.has(telegramId)) {
-            await ctx.deleteMessage(loadingMessage.message_id);
-            continue; // Переходим к началу цикла, где сработает break
+          await ctx.deleteMessage(loadingMessage.message_id);
+          continue;
         }
 
         const newEnrichedItems = Array.from(consolidatedItems.values());
@@ -1031,8 +1068,8 @@ async function processPhotoQueue(ctx: BotContext) {
         await storage.deleteItemsBySessionId(originalSessionId);
         await storage.createInventoryItems(finalItems);
         const finalTotalItems = await storage.getItemsBySessionId(originalSessionId);
-        
-        // --- ВАШ РАБОЧИЙ КОД ФОРМИРОВАНИЯ ОТВЕТА НАЧИНАЕТСЯ ЗДЕСЬ ---
+
+        // Формирование ответа
         let responseText = `✅ Скриншот обработан!\n`;
         responseText += `📊 Распознано на скриншоте: ${rawExtractedItems.length}\n`;
         responseText += `⚙️ Из них опознано и добавлено: ${newEnrichedItems.length}\n`;
@@ -1040,49 +1077,54 @@ async function processPhotoQueue(ctx: BotContext) {
         responseText += `📸 Скриншотов обработано: ${ctx.session.screenshotCount}/${MAX_SCREENSHOTS}\n\n`;
 
         if (unrecognizedItems.length > 0) {
-            responseText += `⚠️ *Не удалось опознать ${unrecognizedItems.length} предмет(ов):*\n`;
-            for (const itemName of unrecognizedItems.slice(0, 5)) { responseText += `• \`${itemName}\`\n`; }
-            if (unrecognizedItems.length > 5) { responseText += `...и еще ${unrecognizedItems.length - 5}.\n`; }
-            responseText += `\n💡 Вы можете скопировать эти названия, исправить их и отправить мне текстом в формате \`Название|Количество\`, чтобы добавить их вручную.\n\n`;
+          responseText += `⚠️ *Не удалось опознать ${unrecognizedItems.length} предмет(ов):*\n`;
+          for (const itemName of unrecognizedItems.slice(0, 5)) {
+            responseText += `• \`${itemName}\`\n`;
+          }
+          if (unrecognizedItems.length > 5) {
+            responseText += `...и еще ${unrecognizedItems.length - 5}.\n`;
+          }
+          responseText += `\n💡 Проверьте написание или отправьте исправленные названия в формате \`Название|Количество\`, например: \`Акцельтра Прайм Ствол|1\`.\n\n`;
         }
 
         const itemsToShow = newEnrichedItems.slice(0, 5);
         if (itemsToShow.length > 0) {
-            responseText += '🎯 Добавленные предметы:\n';
-            for (const item of itemsToShow) { responseText += `• ${item.name} (${item.quantity})\n`; }
-            if (newEnrichedItems.length > 5) { responseText += `... и еще ${newEnrichedItems.length - 5} предметов\n`; }
+          responseText += '🎯 Добавленные предметы:\n';
+          for (const item of itemsToShow) {
+            responseText += `• ${item.name} (${item.quantity})\n`;
+          }
+          if (newEnrichedItems.length > 5) {
+            responseText += `... и еще ${newEnrichedItems.length - 5} предметов\n`;
+          }
         } else if (unrecognizedItems.length === 0) {
-            responseText += '❌ Ни одного предмета не удалось опознать.\n'
+          responseText += '❌ Ни одного предмета не удалось опознать.\n';
         }
 
         await ctx.deleteMessage(loadingMessage.message_id);
 
         if (ctx.session.mode === 'oneshot') {
-            ctx.session.screenshotProcessed = true;
-            await ctx.reply(responseText, { parse_mode: 'Markdown' });
-            await completeSession(ctx);
+          ctx.session.screenshotProcessed = true;
+          await ctx.reply(responseText, { parse_mode: 'Markdown' });
+          await completeSession(ctx);
         } else if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
-            await ctx.reply(responseText + '\n⚠️ Достигнут лимит скриншотов. Завершаю сессию...', { parse_mode: 'Markdown' });
-            await completeSession(ctx);
+          await ctx.reply(responseText + `\n⚠️ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`, { parse_mode: 'Markdown' });
+          await completeSession(ctx);
         } else {
-            const keyboard = Markup.inlineKeyboard([
-                [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
-                [Markup.button.callback('❌ Отменить', 'cancel_session')]
-            ]);
-            await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
+          const keyboard = Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Завершить сессию', 'complete_session')],
+            [Markup.button.callback('❌ Отменить', 'cancel_session')]
+          ]);
+          await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
         }
-        // --- КОНЕЦ ВСЕГО РАБОЧЕГО КОДА ---
-
       } catch (error) {
         console.error('Ошибка при обработке фото из очереди:', error);
-        await ctx.reply('❌ Произошла ошибка при обработке одного из скриншотов. Он был пропущен.');
+        await ctx.reply('❌ Произошла ошибка при анализе скриншота. Проверьте качество изображения или попробуйте снова.');
       }
     }
   } finally {
-    // Снимаем блокировку и флаг отмены в любом случае
     processingLock.delete(telegramId);
     if (cancellationRequests.has(telegramId)) {
-        cancellationRequests.delete(telegramId);
+      cancellationRequests.delete(telegramId);
     }
   }
 }
@@ -1091,19 +1133,33 @@ bot.on('photo', async (ctx) => {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
 
-  // Проверяем сессию, ПРЕЖДЕ чем добавлять в очередь
+  // Проверяем сессию
   if (!ctx.session?.sessionId) {
     await ctx.reply('❌ Нет активной сессии. Нажмите /start, чтобы начать.');
     return;
   }
   if (ctx.session.waitingForExcel) {
-      await ctx.reply('❌ Сначала отправьте Excel файл, прежде чем добавлять скриншоты.');
-      return;
+    await ctx.reply('❌ Сначала отправьте Excel файл, прежде чем добавлять скриншоты.');
+    return;
+  }
+
+  // Проверка лимита скриншотов
+  const MAX_SCREENSHOTS = ctx.session.mode === 'oneshot' ? 1 : ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  if (MAX_SCREENSHOTS === 0) {
+    console.error(`[Photo] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
+    await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
+    return;
+  }
+
+  if (ctx.session.screenshotCount >= MAX_SCREENSHOTS) {
+    await ctx.reply(`❌ Достигнут лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
+    await completeSession(ctx);
+    return;
   }
 
   const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
 
-  // Добавляем фото в личную очередь пользователя
+  // Добавляем фото в очередь
   if (!photoQueue.has(telegramId)) {
     photoQueue.set(telegramId, []);
   }
@@ -1115,7 +1171,7 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  // Если обработчик "спит", запускаем его
+  // Запускаем обработку
   processPhotoQueue(ctx);
 });
 
