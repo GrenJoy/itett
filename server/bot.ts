@@ -144,7 +144,20 @@ bot.use((ctx, next) => {
 // Start command
 bot.start(async (ctx) => {
   const telegramId = ctx.from?.id.toString();
-  if (!telegramId) return;
+  if (!telegramId) {
+    await ctx.reply('❌ Не удалось определить ваш ID. Попробуйте снова.');
+    return;
+  }
+
+  // Cancel any existing session
+  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
+  if (existingSession) {
+    await storage.updateSessionStatus(existingSession.id, 'cancelled');
+    console.log(`Cancelled session ${existingSession.id} for user ${telegramId}`);
+  }
+
+  // Reset session
+  ctx.session = {};
 
   // Create or get user
   let user = await storage.getUserByTelegramId(telegramId);
@@ -156,14 +169,6 @@ bot.start(async (ctx) => {
       lastName: ctx.from?.last_name,
     });
   }
-
-  // Cancel any existing session
-  const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
-  if (existingSession) {
-    await storage.updateSessionStatus(existingSession.id, 'cancelled');
-  }
-  
-  ctx.session = { sessionId: undefined, waitingForExcel: false, waitingForPriceUpdate: false };
 
   const mainKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🆕 Создать новую сессию', 'create_session')],
@@ -411,22 +416,33 @@ bot.action('download_txt', async (ctx) => {
 });
 
 bot.action('download_xlsx', async (ctx) => {
-  // @ts-ignore
-  const lastExport = ctx.session?.lastExport;
-  if (!lastExport?.excel) {
-    await ctx.answerCbQuery('Данные для экспорта устарели.', { show_alert: true });
-    await ctx.editMessageReplyMarkup(
-      Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]]).reply_markup
+  await ctx.answerCbQuery();
+
+  if (!ctx.session?.lastExport?.excel || !ctx.session?.sessionId) {
+    await ctx.editMessageText(
+      '❌ Нет данных для экспорта или сессия не найдена.\n\nНажмите /start, чтобы начать заново.',
+      Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
     );
+    ctx.session = {};
     return;
   }
-  await ctx.answerCbQuery();
-  const excelBuffer = Buffer.from(lastExport.excel, 'base64');
+
+  const excelBuffer = Buffer.from(ctx.session.lastExport.excel, 'base64');
+  const lastExport = ctx.session.lastExport;
+  const sessionId = ctx.session.sessionId;
+
+  // Complete session in database
+  await storage.updateSessionStatus(sessionId, 'completed');
+
+  // Send file
   await ctx.replyWithDocument(
     { source: excelBuffer, filename: `inventory_${Date.now()}.xlsx` },
     { caption: `📊 Ваш инвентарь в .xlsx\n📊 Предметов: ${lastExport.itemsCount}` }
   );
-  ctx.session = {}; // ПОЛНАЯ ОЧИСТКА СЕССИИ
+
+  // Reset session
+  ctx.session = {};
+
   await ctx.editMessageText(
     `✅ Файл .xlsx отправлен!\n\nНажмите /start, чтобы создать новую сессию.`,
     Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
@@ -818,8 +834,17 @@ async function completeSession(ctx: BotContext) {
 
 // Handle photos
 bot.on('photo', async (ctx) => {
-  if (!ctx.session?.sessionId || !ctx.session?.mode) {
-    await ctx.reply('❌ Сначала выберите режим работы командой /start');
+  const telegramId = ctx.from?.id.toString();
+  if (!telegramId || !ctx.session?.sessionId) {
+    await ctx.reply('❌ Нет активной сессии. Нажмите /start, чтобы начать.');
+    return;
+  }
+
+  // Check session status
+  const session = await storage.getSession(ctx.session.sessionId);
+  if (!session || session.status !== 'active') {
+    ctx.session = {};
+    await ctx.reply('❌ Сессия завершена или не найдена. Нажмите /start, чтобы начать новую.');
     return;
   }
   if (ctx.session.waitingForExcel) {
@@ -1291,6 +1316,20 @@ async function handleExcelSplit(ctx: BotContext) {
 
 // Handle text messages (for split price threshold)
 bot.on('text', async (ctx) => {
+  const telegramId = ctx.from?.id.toString();
+  if (!telegramId || !ctx.session?.sessionId) {
+    await ctx.reply('❌ Нет активной сессии. Нажмите /start, чтобы начать.');
+    return;
+  }
+
+  // Проверка статуса сессии в хранилище
+  const session = await storage.getSession(ctx.session.sessionId);
+  if (!session || session.status !== 'active') {
+    ctx.session = {};
+    await ctx.reply('❌ Сессия завершена или не найдена. Нажмите /start, чтобы начать новую.');
+    return;
+  }
+
   // Обработка порога цены для split_excel
   if (ctx.session?.waitingForSplitPrice) {
     const priceText = ctx.message.text.trim();
