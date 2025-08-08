@@ -9,6 +9,7 @@ import { generateExcelBuffer, parseExcelBuffer, generateTextContent } from './se
 // Вверху файла bot.ts
 const processingLock = new Set<string>();
 const photoQueue = new Map<string, string[]>();
+const cancellationRequests = new Set<string>(); // Для немедленной остановки обработки
 function parseTextToItems(text: string): { name: string; quantity: number }[] {
   const lines = text.split('\n').filter(line => line.trim() !== '');
   
@@ -151,14 +152,21 @@ bot.start(async (ctx) => {
     return;
   }
 
-  // Cancel any existing session
+  // Немедленно останавливаем любую текущую обработку для этого пользователя
+  if (photoQueue.has(telegramId)) {
+    photoQueue.delete(telegramId);
+  }
+  cancellationRequests.add(telegramId);
+  console.log(`[STOP] Cancellation requested for user ${telegramId} via /start.`);
+
+  // Cancel any existing session in the database
   const existingSession = await storage.getActiveSessionByTelegramId(telegramId);
   if (existingSession) {
     await storage.updateSessionStatus(existingSession.id, 'cancelled');
-    console.log(`Cancelled session ${existingSession.id} for user ${telegramId}`);
+    console.log(`[DB] Cancelled session ${existingSession.id} for user ${telegramId}`);
   }
 
-  // Reset session
+  // Reset local session context
   ctx.session = {};
 
   // Create or get user
@@ -485,7 +493,22 @@ bot.action('complete_session', async (ctx) => {
 
 // Cancel session handler
 bot.action('cancel_session', async (ctx) => {
-  await cancelSession(ctx);
+  const telegramId = ctx.from?.id.toString();
+  if (telegramId) {
+    if (photoQueue.has(telegramId)) {
+      photoQueue.delete(telegramId);
+    }
+    cancellationRequests.add(telegramId);
+    console.log(`[STOP] Cancellation requested for user ${telegramId} via button.`);
+  }
+  // Вызываем вашу существующую функцию отмены сессии, если она есть
+  // Если нет, то просто отменяем в базе и сбрасываем локальную
+  if (ctx.session?.sessionId) {
+    await storage.updateSessionStatus(ctx.session.sessionId, 'cancelled');
+  }
+  ctx.session = {};
+  await ctx.answerCbQuery();
+  await ctx.reply('❌ Сессия отменена. Очередь обработки очищена. Нажмите /start, чтобы начать новую.');
 });
 
 async function startSession(ctx: BotContext, type: 'oneshot' | 'multishot') {
@@ -671,7 +694,9 @@ async function startSplitExcelSession(ctx: BotContext) {
 
 
 async function completeSession(ctx: BotContext) {
-  if (ctx.callbackQuery) { await ctx.answerCbQuery(); }
+  if (ctx.callbackQuery) {
+    await ctx.answerCbQuery();
+  }
   if (!ctx.session?.sessionId) {
     await ctx.reply('Нет активной сессии для завершения.');
     return;
@@ -679,6 +704,18 @@ async function completeSession(ctx: BotContext) {
 
   const sessionId = ctx.session.sessionId;
   const session = await storage.getSession(sessionId);
+  // ВСТАВКА: Проверка статуса сессии перед обработкой
+  if (!session || session.status !== 'active') {
+    await ctx.reply('❌ Сессия уже завершена или отменена.');
+    const telegramId = ctx.from?.id.toString();
+    if (telegramId) {
+      photoQueue.delete(telegramId);
+      cancellationRequests.delete(telegramId);
+    }
+    ctx.session = {};
+    return;
+  }
+
   const items = await storage.getItemsBySessionId(sessionId);
 
   // Исключаем split_excel из стандартной логики завершения
@@ -690,6 +727,12 @@ async function completeSession(ctx: BotContext) {
   if (items.length === 0) {
     await ctx.reply('❌ В сессии нет предметов для экспорта. Сессия завершена.');
     await storage.updateSessionStatus(sessionId, 'completed');
+    // ВСТАВКА: Очистка ресурсов
+    const telegramId = ctx.from?.id.toString();
+    if (telegramId) {
+      photoQueue.delete(telegramId);
+      cancellationRequests.delete(telegramId);
+    }
     ctx.session = {};
     return;
   }
@@ -711,6 +754,12 @@ async function completeSession(ctx: BotContext) {
       } catch (error) {
         console.error('Error generating text content:', error);
         await ctx.reply('❌ Ошибка при создании текстового файла.');
+        // ВСТАВКА: Очистка ресурсов
+        const telegramId = ctx.from?.id.toString();
+        if (telegramId) {
+          photoQueue.delete(telegramId);
+          cancellationRequests.delete(telegramId);
+        }
         ctx.session = {};
         return;
       }
@@ -739,10 +788,22 @@ async function completeSession(ctx: BotContext) {
             ...Markup.inlineKeyboard([[Markup.button.callback('🆕 Создать новую сессию', 'create_session')]])
           });
         }
+        // ВСТАВКА: Очистка ресурсов
+        const telegramId = ctx.from?.id.toString();
+        if (telegramId) {
+          photoQueue.delete(telegramId);
+          cancellationRequests.delete(telegramId);
+        }
         ctx.session = {};
         return;
       }
 
+      // ВСТАВКА: Очистка ресурсов
+      const telegramId = ctx.from?.id.toString();
+      if (telegramId) {
+        photoQueue.delete(telegramId);
+        cancellationRequests.delete(telegramId);
+      }
       ctx.session = {};
 
       const tooLargeMessage = `⚠️ *Файл Excel слишком большой!*\n\n` +
@@ -775,6 +836,12 @@ async function completeSession(ctx: BotContext) {
     // Логика для oneshot
     if (session?.type === 'oneshot') {
       await storage.updateSessionStatus(sessionId, 'completed');
+      // ВСТАВКА: Очистка ресурсов
+      const telegramId = ctx.from?.id.toString();
+      if (telegramId) {
+        photoQueue.delete(telegramId);
+        cancellationRequests.delete(telegramId);
+      }
       ctx.session = {};
 
       await ctx.reply(`✅ Сессия завершена!\n📊 Найдено предметов: ${items.length}`);
@@ -797,6 +864,12 @@ async function completeSession(ctx: BotContext) {
       if (textBuffer.byteLength > MAX_FILE_SIZE) {
         const textFileSizeMB = (textBuffer.byteLength / (1024 * 1024)).toFixed(2);
         await storage.updateSessionStatus(sessionId, 'completed');
+        // ВСТАВКА: Очистка ресурсов
+        const telegramId = ctx.from?.id.toString();
+        if (telegramId) {
+          photoQueue.delete(telegramId);
+          cancellationRequests.delete(telegramId);
+        }
         ctx.session = {};
 
         const tooLargeMessage = `⚠️ *Текстовый файл слишком большой!*\n\n` +
@@ -846,48 +919,47 @@ async function completeSession(ctx: BotContext) {
   } catch (error) {
     console.error('Error completing session:', error);
     await ctx.reply('❌ Ошибка при создании файлов для экспорта.');
+    // ВСТАВКА: Очистка ресурсов в случае ошибки
+    const telegramId = ctx.from?.id.toString();
+    if (telegramId) {
+      photoQueue.delete(telegramId);
+      cancellationRequests.delete(telegramId);
+    }
+    ctx.session = {};
   }
 }
 
 // Handle photos
 async function processPhotoQueue(ctx: BotContext) {
   const telegramId = ctx.from?.id.toString();
-  if (!telegramId) return;
+  const originalSessionId = ctx.session?.sessionId; // Запоминаем ID сессии на момент запуска
+
+  if (!telegramId || !originalSessionId) return;
 
   // Устанавливаем блокировку
   processingLock.add(telegramId);
 
   try {
-    // Обрабатываем фото из очереди по одному, пока они там есть
     while (photoQueue.has(telegramId) && photoQueue.get(telegramId)!.length > 0) {
-      // Берем самое старое фото из очереди
-      const fileId = photoQueue.get(telegramId)!.shift()!; 
-      
-      // Проверяем сессию и лимиты
-      if (!ctx.session?.sessionId) {
-        await ctx.reply('❌ Нет активной сессии для обработки очереди. Нажмите /start.');
-        photoQueue.delete(telegramId);
-        break;
-      }
-      const session = await storage.getSession(ctx.session.sessionId);
-       if (!session || session.status !== 'active') {
-        await ctx.reply('❌ Сессия была завершена. Очередь скриншотов очищена.');
-        photoQueue.delete(telegramId);
-        break;
-      }
-      if (ctx.session.waitingForExcel) {
-        await ctx.reply('❌ Сначала отправьте Excel файл. Очередь очищена.');
-        photoQueue.delete(telegramId);
-        break;
-      }
-      const MAX_SCREENSHOTS = 16;
-      if ((ctx.session.mode === 'multishot' || ctx.session.mode === 'edit') && (ctx.session.screenshotCount || 0) >= MAX_SCREENSHOTS) {
-        await ctx.reply(`❌ Превышен лимит скриншотов (${MAX_SCREENSHOTS}). Завершаю сессию...`);
-        photoQueue.delete(telegramId);
-        await completeSession(ctx);
-        break;
+      // ПРОВЕРКА №1: Немедленная остановка по флагу
+      if (cancellationRequests.has(telegramId)) {
+        cancellationRequests.delete(telegramId); // Сбрасываем флаг
+        photoQueue.delete(telegramId); // Очищаем остатки очереди
+        console.log(`[Worker] Processing stopped for ${telegramId} due to cancellation request.`);
+        // Не отправляем сообщение здесь, т.к. пользователь уже получил ответ от /start или кнопки отмены
+        break; // Немедленно выходим из цикла
       }
 
+      // ПРОВЕРКА №2: Отложенная проверка статуса сессии в БД
+      const currentSession = await storage.getSession(originalSessionId);
+      if (!currentSession || currentSession.status !== 'active') {
+        await ctx.reply('❌ Сессия была завершена или отменена. Очередь скриншотов очищена.');
+        photoQueue.delete(telegramId);
+        break;
+      }
+      
+      const fileId = photoQueue.get(telegramId)!.shift()!; 
+      
       // Внутренний try...catch для обработки ОДНОГО фото
       try {
         const remainingInQueue = photoQueue.get(telegramId)?.length || 0;
@@ -895,7 +967,6 @@ async function processPhotoQueue(ctx: BotContext) {
         
         ctx.session.screenshotCount = (ctx.session.screenshotCount || 0) + 1;
         
-        // --- ВАШ РАБОЧИЙ КОД ОБРАБОТКИ ФОТО НАЧИНАЕТСЯ ЗДЕСЬ ---
         const fileInfo = await ctx.telegram.getFile(fileId);
         const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
         const response = await fetch(fileUrl);
@@ -903,10 +974,16 @@ async function processPhotoQueue(ctx: BotContext) {
         const base64Image = Buffer.from(buffer).toString('base64');
         const rawExtractedItems = await analyzeWarframeScreenshot(base64Image);
 
+        // Еще одна проверка на отмену СРАЗУ ПОСЛЕ долгой операции
+        if (cancellationRequests.has(telegramId)) {
+            await ctx.deleteMessage(loadingMessage.message_id);
+            continue; // Просто переходим к началу цикла, где сработает break
+        }
+
         if (rawExtractedItems.length === 0) {
           await ctx.deleteMessage(loadingMessage.message_id);
           await ctx.reply('❌ На скриншоте из очереди не найдено предметов Warframe.');
-          continue; // Переходим к следующему фото в очереди
+          continue;
         }
 
         await ctx.telegram.editMessageText(ctx.chat!.id, loadingMessage.message_id, undefined, `🔍 Распознано предметов: ${rawExtractedItems.length}\n⏳ Проверяю названия и получаю цены...`);
@@ -915,14 +992,21 @@ async function processPhotoQueue(ctx: BotContext) {
         const unrecognizedItems: string[] = [];
         
         for (const rawItem of rawExtractedItems) {
+            // Проверка перед каждой тяжелой операцией
+            if (cancellationRequests.has(telegramId)) break;
+
             const correctedName = getCorrectedItemName(rawItem.name);
             if (correctedName) {
                 if (consolidatedItems.has(correctedName)) {
                     consolidatedItems.get(correctedName)!.quantity += rawItem.quantity;
                 } else {
                     const marketItem = await processItemForMarket(correctedName);
+                    // Проверка после тяжелой операции
+                    if (cancellationRequests.has(telegramId)) break;
+
                     const newItem: InsertInventoryItem = {
-                        sessionId: ctx.session!.sessionId!, name: correctedName, quantity: rawItem.quantity,
+                        sessionId: originalSessionId, // Используем ID старой сессии
+                        name: correctedName, quantity: rawItem.quantity,
                         slug: marketItem?.slug || null, sellPrices: marketItem?.sellPrices || [], buyPrices: marketItem?.buyPrices || [],
                         avgSell: marketItem?.avgSell ? Math.round(marketItem.avgSell * 100) : 0, avgBuy: marketItem?.avgBuy ? Math.round(marketItem.avgBuy * 100) : 0,
                         marketUrl: marketItem?.marketUrl || null, source: 'screenshot' as const
@@ -934,13 +1018,19 @@ async function processPhotoQueue(ctx: BotContext) {
             }
         }
         
+        // Финальная проверка перед записью в БД
+        if (cancellationRequests.has(telegramId)) {
+            await ctx.deleteMessage(loadingMessage.message_id);
+            continue; // Переходим к началу цикла, где сработает break
+        }
+
         const newEnrichedItems = Array.from(consolidatedItems.values());
-        const existingItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
+        const existingItems = await storage.getItemsBySessionId(originalSessionId);
         const finalItems = consolidateItems(newEnrichedItems, existingItems);
 
-        await storage.deleteItemsBySessionId(ctx.session.sessionId!);
+        await storage.deleteItemsBySessionId(originalSessionId);
         await storage.createInventoryItems(finalItems);
-        const finalTotalItems = await storage.getItemsBySessionId(ctx.session.sessionId!);
+        const finalTotalItems = await storage.getItemsBySessionId(originalSessionId);
         
         // --- ВАШ РАБОЧИЙ КОД ФОРМИРОВАНИЯ ОТВЕТА НАЧИНАЕТСЯ ЗДЕСЬ ---
         let responseText = `✅ Скриншот обработан!\n`;
@@ -989,10 +1079,14 @@ async function processPhotoQueue(ctx: BotContext) {
       }
     }
   } finally {
-    // Снимаем блокировку только когда очередь пуста
+    // Снимаем блокировку и флаг отмены в любом случае
     processingLock.delete(telegramId);
+    if (cancellationRequests.has(telegramId)) {
+        cancellationRequests.delete(telegramId);
+    }
   }
 }
+
 bot.on('photo', async (ctx) => {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) return;
