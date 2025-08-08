@@ -21,6 +21,8 @@ export const sessions = pgTable("sessions", {
   status: text("status", { enum: ["active", "completed", "cancelled"] }).default("active").notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   completedAt: timestamp("completed_at"),
+  photoLimit: integer("photo_limit").notNull().default(16),
+  expiresAt: timestamp("expires_at"),
 }, (table) => ({
   typeCheck: check("type_check", sql`${table.type} IN ('multishot', 'edit', 'price_update', 'split_excel')`),
   statusCheck: check("status_check", sql`${table.status} IN ('active', 'completed', 'cancelled')`),
@@ -75,6 +77,8 @@ export const insertSessionSchema = createInsertSchema(sessions).pick({
   telegramId: true,
   type: true,
   status: true,
+  photoLimit: true,
+  expiresAt: true,
 });
 
 export const insertInventoryItemSchema = createInsertSchema(inventoryItems).pick({

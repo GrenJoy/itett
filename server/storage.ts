@@ -1,6 +1,6 @@
 import { users, sessions, inventoryItems, type User, type InsertUser, type Session, type InsertSession, type InventoryItem, type InsertInventoryItem } from "@shared/schema";
 import { db } from "./db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, lt } from "drizzle-orm";
 
 export interface IStorage {
   // User operations
@@ -13,6 +13,7 @@ export interface IStorage {
   getActiveSessionByTelegramId(telegramId: string): Promise<Session | undefined>;
   createSession(session: InsertSession): Promise<Session>;
   updateSessionStatus(id: string, status: "active" | "completed" | "cancelled"): Promise<void>;
+  getExpiredSessions(): Promise<Session[]>;
   
   // Inventory item operations
   getItemsBySessionId(sessionId: string): Promise<InventoryItem[]>;
@@ -72,6 +73,17 @@ export class DatabaseStorage implements IStorage {
         completedAt: status === "completed" ? new Date() : null 
       })
       .where(eq(sessions.id, id));
+  }
+
+  async getExpiredSessions(): Promise<Session[]> {
+    const now = new Date();
+    return await db
+      .select()
+      .from(sessions)
+      .where(and(
+        eq(sessions.status, "active"),
+        lt(sessions.expiresAt, now)
+      ));
   }
 
   async getItemsBySessionId(sessionId: string): Promise<InventoryItem[]> {

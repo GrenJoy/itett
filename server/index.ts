@@ -16,6 +16,20 @@ async function startBot() {
     await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(e => console.log('Webhook deletion failed (expected if not set):', e.message));
     await bot.launch({ dropPendingUpdates: true });
     console.log('Telegram bot started successfully');
+
+    // Background cleanup for expired sessions
+    setInterval(async () => {
+      try {
+        const { storage } = await import('./storage');
+        const expiredSessions = await storage.getExpiredSessions();
+        for (const session of expiredSessions) {
+          console.log(`[Cleanup] Auto-completing expired session ${session.id} for user ${session.telegramId}`);
+          await storage.updateSessionStatus(session.id, 'completed');
+        }
+      } catch (error) {
+        console.error('Error during expired session cleanup:', error);
+      }
+    }, 5 * 60 * 1000); // Check every 5 minutes
   } catch (error: any) {
     console.error('Failed to start bot:', error);
     if (error.response?.error_code === 409) {
@@ -75,7 +89,7 @@ app.get('/', (req, res) => {
         <div class="features">
             <h3>🚀 Возможности бота</h3>
             <ul>
-                <li><strong>🎯 Одноразовый анализ</strong> - скриншоты → Excel файл</li>
+                <li><strong>🎯 Анализ скриншотов</strong> - скриншоты → Excel файл (до 16 скриншотов)</li>
                 <li><strong>📊 Многоразовый анализ</strong> - накопление данных из нескольких сессий</li>
                 <li><strong>📝 Редактирование Excel</strong> - импорт Excel + новые скриншоты</li>
                 <li><strong>🤖 ИИ анализ</strong> - Gemini AI для распознавания предметов</li>

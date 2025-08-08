@@ -70,6 +70,12 @@ This is a Warframe inventory management Telegram bot that analyzes game screensh
   - Updated help documentation and status commands
   - Enhanced session lifecycle management with proper cleanup
   - Fixed photo handler to automatically complete sessions at limits
+- **Database Schema Modernization (August 2025):**
+  - Added photoLimit and expiresAt fields to sessions table
+  - Updated Drizzle schema to match production database constraints
+  - Implemented background cleanup for expired sessions (5-minute intervals)
+  - Enhanced storage interface with getExpiredSessions method
+  - All session creation now includes proper expiration times and photo limits
 
 # User Preferences
 

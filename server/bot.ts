@@ -516,7 +516,9 @@ async function startSession(ctx: BotContext) {
     userId: user.id,
     telegramId,
     type: 'multishot',
-    status: 'active'
+    status: 'active',
+    photoLimit: 16,
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
   });
 
   if (!session || !session.id) {
@@ -568,7 +570,9 @@ async function startEditSession(ctx: BotContext) {
     userId: user.id,
     telegramId,
     type: 'edit',
-    status: 'active'
+    status: 'active',
+    photoLimit: 16,
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
   });
 
   ctx.session!.sessionId = session.id;
@@ -606,7 +610,9 @@ async function startPriceUpdateSession(ctx: BotContext) {
     userId: user.id,
     telegramId,
     type: 'price_update',
-    status: 'active'
+    status: 'active',
+    photoLimit: 0, // No photo processing for price updates
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
   });
 
   ctx.session!.sessionId = session.id;
@@ -647,7 +653,9 @@ async function startSplitExcelSession(ctx: BotContext) {
     userId: user.id,
     telegramId,
     type: 'split_excel',
-    status: 'active'
+    status: 'active',
+    photoLimit: 0, // No photo processing for Excel splitting
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000) // 1 hour from now
   });
 
   ctx.session!.sessionId = session.id;
@@ -908,8 +916,9 @@ async function processPhotoQueue(ctx: BotContext) {
     return;
   }
 
-  // Определяем лимит скриншотов (всегда 16 для всех режимов анализа)
-  const MAX_SCREENSHOTS = ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  // Определяем лимит скриншотов из сессии в БД
+  const sessionData = await storage.getSession(originalSessionId);
+  const MAX_SCREENSHOTS = sessionData?.photoLimit || 16;
   if (MAX_SCREENSHOTS === 0) {
     console.error(`[Worker] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
     await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
@@ -1094,21 +1103,16 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  // Проверка срока жизни сессии (1 час)
-  const session = await storage.getSession(ctx.session.sessionId);
-  if (session) {
-    const sessionAge = Date.now() - new Date(session.createdAt).getTime();
-    const maxSessionAge = 60 * 60 * 1000; // 1 час в миллисекундах
-    
-    if (sessionAge > maxSessionAge) {
-      await ctx.reply('⏰ Сессия истекла (прошел 1 час). Завершаю сессию...');
-      await completeSession(ctx);
-      return;
-    }
+  // Проверка срока жизни сессии и получение лимита скриншотов
+  const sessionData = await storage.getSession(ctx.session.sessionId);
+  if (sessionData?.expiresAt && new Date() > sessionData.expiresAt) {
+    await ctx.reply('⏰ Сессия истекла. Завершаю сессию...');
+    await completeSession(ctx);
+    return;
   }
 
-  // Проверка лимита скриншотов (16 для всех режимов анализа)
-  const MAX_SCREENSHOTS = ctx.session.mode === 'multishot' || ctx.session.mode === 'edit' ? 16 : 0;
+  // Получаем лимит скриншотов из сессии в базе данных  
+  const MAX_SCREENSHOTS = sessionData?.photoLimit || 16;
   if (MAX_SCREENSHOTS === 0) {
     console.error(`[Photo] Invalid session mode for user ${telegramId}: ${ctx.session.mode}`);
     await ctx.reply('❌ Ошибка: неверный режим сессии. Нажмите /start, чтобы начать заново.');
