@@ -872,7 +872,8 @@ async function processPhotoQueue(ctx: BotContext) {
 async function startBatchProcessing(ctx: BotContext) {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId) {
-    console.log('[Batch] No telegramId in context');
+    console.error('[Batch] No telegramId in context');
+    await ctx.reply('❌ Ошибка: не удалось определить ваш ID. Нажмите /start, чтобы начать заново.');
     return;
   }
   if (processingLock.has(telegramId)) {
@@ -896,7 +897,10 @@ async function startBatchProcessing(ctx: BotContext) {
 
 bot.on('photo', async (ctx) => {
   const telegramId = ctx.from?.id.toString();
-  if (!telegramId) return;
+  if (!telegramId) {
+    await ctx.reply('❌ Не удалось определить ваш ID. Нажмите /start, чтобы начать.');
+    return;
+  }
   if (processingLock.has(telegramId)) {
     await ctx.reply('⏳ Пожалуйста, подождите. Идет обработка предыдущей пачки скриншотов.');
     return;
@@ -940,9 +944,17 @@ bot.on('photo', async (ctx) => {
   if (userDebounceTimers.has(telegramId)) {
     clearTimeout(userDebounceTimers.get(telegramId)!);
   }
+  // Создаем копию контекста для таймера
+  const ctxCopy = {
+    ...ctx,
+    session: { ...ctx.session },
+    from: { ...ctx.from },
+    chat: { ...ctx.chat },
+    reply: ctx.reply.bind(ctx),
+    telegram: ctx.telegram
+  };
   const timer = setTimeout(() => {
-    const sessionCopy = { ...ctx.session };
-    startBatchProcessing({ ...ctx, session: sessionCopy });
+    startBatchProcessing(ctxCopy);
     userDebounceTimers.delete(telegramId);
   }, DEBOUNCE_TIMEOUT_MS);
   userDebounceTimers.set(telegramId, timer);
