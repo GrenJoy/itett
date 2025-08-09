@@ -743,7 +743,6 @@ async function fetchWithTimeout(resource: string, options: any = {}, timeout = 1
 }
 
 async function processPhotoQueue(telegramId: string, chatId: number, userSession: any) {
-  const telegramId = ctx.from?.id.toString();
   if (!telegramId || !ctx.session || !ctx.session.sessionId) {
     console.error(`[Photo Queue] Session not initialized for user ${telegramId}`);
     await ctx.reply('❌ Сессия не инициализирована. Нажмите /start, чтобы начать заново.');
