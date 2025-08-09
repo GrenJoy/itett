@@ -728,7 +728,21 @@ async function sendFinalReport(ctx: BotContext) {
   await ctx.reply(responseText, { parse_mode: 'Markdown', ...keyboard });
 }
 
-async function processPhotoQueue(ctx: BotContext) {
+async function fetchWithTimeout(resource: string, options: any = {}, timeout = 10000) { // 10 секунд
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(resource, { ...options, signal: controller.signal });
+    return response;
+  } catch (error: any) {
+    if (error.name === 'AbortError') throw new Error('Request timed out');
+    throw error;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function processPhotoQueue(telegramId: string, chatId: number, userSession: any) {
   const telegramId = ctx.from?.id.toString();
   if (!telegramId || !ctx.session || !ctx.session.sessionId) {
     console.error(`[Photo Queue] Session not initialized for user ${telegramId}`);
@@ -869,30 +883,35 @@ async function processPhotoQueue(ctx: BotContext) {
   }
 }
 
-async function startBatchProcessing(ctx: BotContext) {
-  const telegramId = ctx.from?.id.toString();
+async function startBatchProcessing(telegramId: string, chatId: number) {
   if (!telegramId) {
-    console.error('[Batch] No telegramId in context');
-    await ctx.reply('❌ Ошибка: не удалось определить ваш ID. Нажмите /start, чтобы начать заново.');
+    console.error('[Batch] No telegramId provided');
+    await bot.telegram.sendMessage(chatId, '❌ Ошибка: не удалось определить ваш ID. Нажмите /start, чтобы начать заново.');
     return;
   }
+
   if (processingLock.has(telegramId)) {
     console.log(`[Batch] Processing already locked for user ${telegramId}`);
     return;
   }
+
   const queueSize = photoQueue.get(telegramId)?.length || 0;
   if (queueSize === 0) {
     console.log(`[Batch] Empty queue for user ${telegramId}`);
     return;
   }
+
   processingLock.add(telegramId);
-  await ctx.reply(`✅ Принято ${queueSize} фото. Начинаю обработку... Это может занять некоторое время.`);
-  if (ctx.session) {
-    ctx.session.batchUnrecognizedItems = [];
-    ctx.session.batchNewlyAddedCount = 0;
-    sessions.set(ctx.chat!.id.toString(), ctx.session);
+
+  await bot.telegram.sendMessage(chatId, `✅ Принято ${queueSize} фото. Начинаю обработку... Это может занять некоторое время.`);
+
+  const userSession = sessions.get(telegramId);
+  if (userSession) {
+    userSession.batchUnrecognizedItems = [];
+    userSession.batchNewlyAddedCount = 0;
   }
-  await processPhotoQueue(ctx);
+
+  await processPhotoQueue(telegramId, chatId, userSession);
 }
 
 bot.on('photo', async (ctx) => {
@@ -901,32 +920,39 @@ bot.on('photo', async (ctx) => {
     await ctx.reply('❌ Не удалось определить ваш ID. Нажмите /start, чтобы начать.');
     return;
   }
+
   if (processingLock.has(telegramId)) {
     await ctx.reply('⏳ Пожалуйста, подождите. Идет обработка предыдущей пачки скриншотов.');
     return;
   }
+
   if (!ctx.session?.sessionId) {
     await ctx.reply('❌ Нет активной сессии. Нажмите /start, чтобы начать.');
     return;
   }
+
   if (ctx.session.waitingForExcel) {
     await ctx.reply('❌ Сначала отправьте Excel файл, прежде чем добавлять скриншоты.');
     return;
   }
+
   const session = await storage.getSession(ctx.session.sessionId);
   if (!session) {
     await ctx.reply('❌ Сессия не найдена в базе данных');
     cleanupSession(ctx);
     return;
   }
+
   if (session.expiresAt && new Date() > session.expiresAt) {
     await ctx.reply('⏰ Время сессии истекло. Завершаю...');
     await completeSession(ctx);
     return;
   }
+
   const currentQueueSize = photoQueue.get(telegramId)?.length || 0;
   const processedCount = ctx.session.screenshotCount || 0;
   const totalPhotos = processedCount + currentQueueSize + 1;
+
   if (session.photoLimit > 0 && totalPhotos > session.photoLimit) {
     await ctx.reply(
       `🚫 Достигнут лимит ${session.photoLimit} скриншотов.\n` +
@@ -935,28 +961,27 @@ bot.on('photo', async (ctx) => {
     await completeSession(ctx);
     return;
   }
+
   const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
   if (!photoQueue.has(telegramId)) {
     photoQueue.set(telegramId, []);
   }
+
   photoQueue.get(telegramId)!.push(fileId);
   console.log(`[Photo] Added photo to queue for user ${telegramId}, queue size: ${photoQueue.get(telegramId)!.length}`);
+
   if (userDebounceTimers.has(telegramId)) {
     clearTimeout(userDebounceTimers.get(telegramId)!);
   }
-  // Создаем копию контекста для таймера
-  const ctxCopy = {
-    ...ctx,
-    session: { ...ctx.session },
-    from: { ...ctx.from },
-    chat: { ...ctx.chat },
-    reply: ctx.reply.bind(ctx),
-    telegram: ctx.telegram
-  };
+
+  // --- Новый вариант с chatId ---
+  const chatId = ctx.chat.id; // сохраняем только ID чата
+
   const timer = setTimeout(() => {
-    startBatchProcessing(ctxCopy);
+    startBatchProcessing(telegramId, chatId); // передаем только ID, а не весь ctx
     userDebounceTimers.delete(telegramId);
   }, DEBOUNCE_TIMEOUT_MS);
+
   userDebounceTimers.set(telegramId, timer);
 });
 
