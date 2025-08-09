@@ -258,7 +258,7 @@ bot.action('create_session', async (ctx) => {
 // Mode selection handlers
 bot.action('mode_multishot', async (ctx) => {
   await ctx.answerCbQuery();
-  await startSession(ctx);
+  await startSession(ctx, 'multishot'); 
 });
 
 bot.action('mode_edit', async (ctx) => {
